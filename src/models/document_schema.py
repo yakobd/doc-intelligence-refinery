@@ -1,109 +1,98 @@
+import hashlib
 from enum import Enum
-from typing import List, Optional, Any
+from typing import List, Optional, Dict, Union, Any
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
+# 1. Type Precision: Dedicated BBox Model (Rubric Item #2)
+class BBox(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+    page_number: int
 
+# 2. Categorical Fields: Enums
 class OriginType(str, Enum):
-    """Represents the source nature of document content."""
     NATIVE_DIGITAL = "native_digital"
     SCANNED_IMAGE = "scanned_image"
     MIXED = "mixed"
 
-
 class LayoutComplexity(str, Enum):
-    """Represents structural complexity of page layout."""
     SINGLE_COLUMN = "single_column"
     MULTI_COLUMN = "multi_column"
     TABLE_HEAVY = "table_heavy"
 
+class StrategyTier(str, Enum):
+    STRATEGY_A = "FASTTEXT"
+    STRATEGY_B = "LAYOUT"
+    STRATEGY_C = "VISION"
 
-class EstimatedCost(str, Enum):
-    """Represents estimated processing cost tier for extraction."""
-    FAST_TEXT_SUFFICIENT = "fast_text_sufficient"
-    NEEDS_LAYOUT_MODEL = "needs_layout_model"
-    NEEDS_VISION_MODEL = "needs_vision_model"
-
-
-# --- NEW RUBRIC REQUIRED MODELS ---
-
-class PageIndex(BaseModel):
-    """Maps physical pages to logical content locations."""
-    model_config = ConfigDict(extra="forbid")
-    
-    page_number: int = Field(ge=1)
-    char_start: int = Field(description="Start character index in full text stream")
-    char_end: int = Field(description="End character index in full text stream")
-
-
+# 3. Provenance Citation Chains (Rubric Item #3)
 class ProvenanceChain(BaseModel):
-    """Tracks the 'who, what, where' of an extracted piece of data."""
     model_config = ConfigDict(extra="forbid")
-    
-    strategy_used: str
-    model_version: str = "v1.0"
-    confidence_score: float = Field(ge=0.0, le=1.0)
     source_file: str
+    content_hash: str  # Required for Mastery
+    bbox: BBox         # Required: Structured sub-model
+    strategy_used: str
     extraction_timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
-
+# 4. Logical Document Units (LDU) (Rubric Item #3 & #4)
 class LDU(BaseModel):
-    """Logical Document Unit (e.g., a Section, a Chapter, or a Table)."""
     model_config = ConfigDict(extra="forbid")
-    
-    unit_id: str
-    unit_type: str  # e.g., "table", "paragraph", "header"
+    uid: str
+    unit_type: str  # e.g., "table", "paragraph"
     content: str
-    page_range: List[int]
-    provenance: ProvenanceChain
+    content_hash: str    # Required for Mastery
+    page_refs: List[int] # Required for Mastery
+    bounding_box: BBox   # Required for Mastery
+    parent_section: Optional[str] = None # Recursive relationship
+    child_chunks: List[str] = []         # Chunk relationship
+    
+    @field_validator('content')
+    @classmethod
+    def content_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("LDU content cannot be empty")
+        return v
 
+# 5. Hierarchical Page/Section Indexing (Rubric Item #4)
+class PageIndexNode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str
+    page_start: int
+    page_end: int
+    children: List["PageIndexNode"] = [] # Required: Recursive nodes
 
-# --- EXISTING COMPONENTS ---
+    @model_validator(mode='after')
+    def validate_range(self) -> 'PageIndexNode':
+        if self.page_end < self.page_start:
+            raise ValueError(f"page_end ({self.page_end}) must be >= page_start")
+        return self
 
+# Rebuild model to support the recursive "children" type
+PageIndexNode.model_rebuild()
+
+# 6. Document Profiling (Triage Output)
 class DocumentProfile(BaseModel):
-    """Document-level profile used for strategy routing."""
     model_config = ConfigDict(extra="forbid")
+    filename: str
+    origin_type: OriginType
+    layout_complexity: LayoutComplexity
+    selected_strategy: StrategyTier
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    estimated_cost: float
+    pages: int
+    language: str = "en"
+    domain_hint: str = "financial"
 
-    filename: str = Field(description="Source PDF filename used for artifact naming and traceability.", min_length=1)
-    origin_type: OriginType = Field(description="Origin classification.")
-    layout_complexity: LayoutComplexity = Field(description="Structural complexity.")
-    language: str = Field(description="Primary language.", min_length=1)
-    domain_hint: str = Field(description="Business/domain hint.", min_length=1)
-    estimated_cost: EstimatedCost = Field(description="Cost tier.")
-
-
-class Table(BaseModel):
-    """Structured representation of a table extracted from a page."""
+# 7. Normalized Extraction Output
+class NormalizedOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    headers: List[str]
-    rows: List[List[str]]
-    title: Optional[str] = None
-
-
-class ExtractedPage(BaseModel):
-    """Page-level extraction payload."""
-    model_config = ConfigDict(extra="forbid")
-
-    page_number: int = Field(ge=1)
-    text: str
-    tables: List[Table] = Field(default_factory=list)
-    extraction_confidence: float = Field(ge=0.0, le=1.0)
-
-
-class ExtractedDocument(BaseModel):
-    """Master document contract for downstream indexing and analytics."""
-    model_config = ConfigDict(extra="forbid")
-
     filename: str
     doc_id: str
     profile: DocumentProfile
-    pages: List[ExtractedPage] = Field(default_factory=list)
-    
-    # New Field for Rubric
-    logical_units: List[LDU] = Field(
-        default_factory=list, 
-        description="Collection of LDUs (Logical Document Units) like sections or tables."
-    )
-    
-    strategy_used: str
+    ldus: List[LDU]
+    index: List[PageIndexNode]
+    metadata: Dict[str, Any]

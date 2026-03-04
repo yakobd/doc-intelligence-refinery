@@ -12,8 +12,10 @@ def test_full_pipeline():
         print(f"📄 Processing: {file}...")
         try:
             result = orchestrator.process_document(path)
-            print(f"✅ Success! Used: {result.strategy_used} | Pages: {len(result.pages)}\n")
-        except Exception as e:
+            selected_strategy = result.metadata.get("selected_strategy", result.profile.selected_strategy.value)
+            covered_pages = len({page for ldu in result.ldus for page in ldu.page_refs})
+            print(f"✅ Success! Used: {selected_strategy} | Pages: {covered_pages}\n")
+        except BaseException as e:
             print(f"❌ Failed {file}: {e}\n")
 
 if __name__ == "__main__":

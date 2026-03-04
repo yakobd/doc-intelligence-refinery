@@ -1,207 +1,281 @@
-import pdfplumber
 from pathlib import Path
+from typing import Any
+import logging
+
+import pdfplumber
 
 from src.models.document_schema import (
-	DocumentProfile,
-	EstimatedCost,
-	LayoutComplexity,
-	OriginType,
+    DocumentProfile,
+    LayoutComplexity,
+    OriginType,
+    StrategyTier,
 )
+from src.utils.config_loader import get_triage_config, load_config
+
+
+logger = logging.getLogger(__name__)
 
 
 class TriageAgent:
-	"""Profiles documents and routes them toward an extraction strategy."""
+    """Profiles documents and routes them toward an extraction strategy."""
 
-	DOMAIN_KEYWORDS = {
-		"financial": [
-			"inflation",
-			"cbe",
-			"birr",
-			"balance sheet",
-			"bank",
-		],
-		"legal": [
-			"law",
-			"regulation",
-			"compliance",
-			"statute",
-		],
-		"technical": [
-			"system",
-			"architecture",
-			"api",
-			"integration",
-		],
-		"medical": [
-			"patient",
-			"diagnosis",
-			"treatment",
-			"clinical",
-		],
-		"technical_legal": [
-			"vulnerability",
-			"standard",
-			"procedure",
-			"clause",
-		],
-	}
+    def __init__(self, config: dict[str, Any] | None = None, config_path: str = "rubric/extraction_rules.yaml") -> None:
+        self.config = config or load_config(config_path)
+        self.rules = self._load_rules()
+        self.thresholds = self.rules["thresholds"]
+        self.domain_keywords = self.rules["domain_keywords"]
+        self.cost_tiers = self.rules["cost_tiers"]
+    def profile_document(self, pdf_path: str) -> DocumentProfile:
+        filename = Path(pdf_path).name
 
-	def profile_document(self, pdf_path: str) -> DocumentProfile:
-		"""Analyze the first page and return a DocumentProfile.
+        with pdfplumber.open(pdf_path) as pdf:
+            signals = self._collect_pdf_signals(pdf)
 
-		Args:
-			pdf_path: Path to the PDF document.
+        origin_type = self._detect_origin(signals)
+        layout_complexity = self._detect_layout_complexity(signals)
+        domain_hint = self._classify_domain(signals["combined_text"])
+        selected_strategy = self._select_strategy(origin_type, layout_complexity)
+        confidence_score = self._calculate_confidence(signals, origin_type)
+        estimated_cost = self._estimate_cost(selected_strategy)
 
-		Returns:
-			A populated DocumentProfile based on first-page heuristics.
-		"""
-		filename = Path(pdf_path).name
+        return DocumentProfile(
+            filename=filename,
+            origin_type=origin_type,
+            layout_complexity=layout_complexity,
+            selected_strategy=selected_strategy,
+            confidence_score=confidence_score,
+            estimated_cost=estimated_cost,
+            pages=signals["total_pages"],
+            language="en",
+            domain_hint=domain_hint,
+        )
 
-		with pdfplumber.open(pdf_path) as pdf:
-			if not pdf.pages:
-				origin_type = OriginType.SCANNED_IMAGE
-				layout_complexity = LayoutComplexity.MULTI_COLUMN
-				domain_hint = "general"
-				estimated_cost = EstimatedCost.NEEDS_VISION_MODEL
-				return DocumentProfile(
-					filename=filename,
-					origin_type=origin_type,
-					layout_complexity=layout_complexity,
-					language="en",
-					domain_hint=domain_hint,
-					estimated_cost=estimated_cost,
-				)
+    def _load_rules(self) -> dict[str, Any]:
+        triage_config = get_triage_config(self.config)
+        if not isinstance(triage_config, dict):
+            raise ValueError("Missing triage_config in rubric/extraction_rules.yaml")
 
-			page = pdf.pages[0]
-			text = page.extract_text() or ""
+        required_sections = ["thresholds", "domain_keywords", "cost_tiers"]
+        for section in required_sections:
+            if section not in triage_config:
+                raise ValueError(f"Missing '{section}' in rubric/extraction_rules.yaml triage_config")
 
-			char_count = len(text)
-			has_tables = bool(page.find_tables())
-			image_count = len(page.images or [])
-			page_area = float(page.width) * float(page.height)
-			chars = page.objects.get("char", [])
+        return triage_config
 
-			origin_type = self._detect_origin(char_count=char_count, image_count=image_count)
-			layout_complexity = self._detect_layout_complexity(
-				has_tables=has_tables,
-				char_count=char_count,
-				chars=chars,
-				page_height=float(page.height),
-			)
-			domain_hint = self._detect_domain_hint(text)
-			estimated_cost = self._estimate_cost(origin_type, layout_complexity)
+    def _collect_pdf_signals(self, pdf: pdfplumber.PDF) -> dict[str, Any]:
+        total_pages = len(pdf.pages)
+        if total_pages == 0:
+            return {
+                "total_pages": 1,
+                "has_fonts_any": False,
+                "low_density_ratio": 1.0,
+                "avg_chars_per_page": 0.0,
+                "avg_bbox_density": 0.0,
+                "table_page_ratio": 0.0,
+                "gutter_found": False,
+                "combined_text": "",
+                "has_acroform": self._has_acroform(pdf),
+                "text_rich_pages": 0,
+            }
 
-			_ = page_area
+        combined_text_parts: list[str] = []
+        fonts_detected_pages = 0
+        low_density_pages = 0
+        table_pages = 0
+        text_rich_pages = 0
 
-			return DocumentProfile(
-				filename=filename,
-				origin_type=origin_type,
-				layout_complexity=layout_complexity,
-				language="en",
-				domain_hint=domain_hint,
-				estimated_cost=estimated_cost,
-			)
+        total_chars = 0
+        total_bbox_density = 0.0
+        gutter_found = False
 
-	def _detect_origin(self, char_count: int, image_count: int) -> OriginType:
-		if char_count < 50 and image_count > 0:
-			return OriginType.SCANNED_IMAGE
-		return OriginType.NATIVE_DIGITAL
+        for page in pdf.pages:
+            try:
+                text = page.extract_text() or ""
+                combined_text_parts.append(text)
 
-	def _detect_layout_complexity(
-		self,
-		has_tables: bool,
-		char_count: int,
-		chars: list,
-		page_height: float,
-	) -> LayoutComplexity:
-		if has_tables:
-			return LayoutComplexity.TABLE_HEAVY
+                char_count = len(text)
+                total_chars += char_count
 
-		if self._has_vertical_gutter(chars=chars, page_height=page_height):
-			return LayoutComplexity.MULTI_COLUMN
+                chars = page.objects.get("char", [])
+                if any(char.get("fontname") for char in chars):
+                    fonts_detected_pages += 1
 
-		if char_count > 1500:
-			return LayoutComplexity.SINGLE_COLUMN
+                if char_count <= float(self.thresholds["scanned_image_char_density"]):
+                    low_density_pages += 1
 
-		return LayoutComplexity.MULTI_COLUMN
+                if bool(page.find_tables()):
+                    table_pages += 1
 
-	def _has_vertical_gutter(self, chars: list, page_height: float) -> bool:
-		"""Detect a likely multi-column gutter between x=200 and x=400.
+                if char_count >= float(self.thresholds["single_column_min_chars_per_page"]):
+                    text_rich_pages += 1
 
-		A gutter is considered present when:
-		- There is text on both the left and right sides of the gutter region.
-		- The gutter region remains empty across most vertical slices of the page.
-		"""
-		if not chars or page_height <= 0:
-			return False
+                page_area = max(1.0, float(page.width) * float(page.height))
+                char_bbox_area = 0.0
+                for char in chars:
+                    x0 = float(char.get("x0", 0.0) or 0.0)
+                    x1 = float(char.get("x1", 0.0) or 0.0)
+                    top = float(char.get("top", 0.0) or 0.0)
+                    bottom = float(char.get("bottom", top) or top)
 
-		gutter_x_min, gutter_x_max = 200.0, 400.0
-		left_char_count = 0
-		right_char_count = 0
-		gutter_vertical_spans: list[tuple[float, float]] = []
+                    width = max(0.0, x1 - x0)
+                    height = max(0.0, bottom - top)
+                    char_bbox_area += width * height
 
-		for char in chars:
-			x0 = float(char.get("x0", 0.0) or 0.0)
-			x1 = float(char.get("x1", 0.0) or 0.0)
-			top = float(char.get("top", 0.0) or 0.0)
-			bottom = float(char.get("bottom", top) or top)
+                bbox_density = char_bbox_area / page_area
+                total_bbox_density += bbox_density
 
-			if x1 < gutter_x_min:
-				left_char_count += 1
-			if x0 > gutter_x_max:
-				right_char_count += 1
+                if not gutter_found and self._has_vertical_gutter(chars=chars, page_height=float(page.height)):
+                    gutter_found = True
+            except BaseException as page_error:
+                logger.warning("Triage skipped a problematic page while collecting signals: %s", page_error)
+                low_density_pages += 1
+                continue
 
-			intersects_gutter = not (x1 <= gutter_x_min or x0 >= gutter_x_max)
-			if intersects_gutter:
-				start = max(0.0, min(top, page_height))
-				end = max(0.0, min(bottom, page_height))
-				if end > start:
-					gutter_vertical_spans.append((start, end))
+        return {
+            "total_pages": total_pages,
+            "has_fonts_any": fonts_detected_pages > 0,
+            "low_density_ratio": low_density_pages / total_pages,
+            "avg_chars_per_page": total_chars / total_pages,
+            "avg_bbox_density": total_bbox_density / total_pages,
+            "table_page_ratio": table_pages / total_pages,
+            "gutter_found": gutter_found,
+            "combined_text": "\n".join(combined_text_parts),
+            "has_acroform": self._has_acroform(pdf),
+            "text_rich_pages": text_rich_pages,
+        }
 
-		if left_char_count < 80 or right_char_count < 80:
-			return False
+    def _has_acroform(self, pdf: pdfplumber.PDF) -> bool:
+        catalog = getattr(getattr(pdf, "doc", None), "catalog", {}) or {}
+        return ("AcroForm" in catalog) or ("/AcroForm" in catalog)
 
-		slice_count = 20
-		slice_height = page_height / slice_count
-		empty_slices = 0
+    def _detect_origin(self, signals: dict[str, Any]) -> OriginType:
+        if not signals["has_fonts_any"]:
+            if signals["has_acroform"]:
+                return OriginType.MIXED
+            return OriginType.SCANNED_IMAGE
 
-		for idx in range(slice_count):
-			slice_start = idx * slice_height
-			slice_end = slice_start + slice_height
-			has_gutter_char = any(
-				not (span_end <= slice_start or span_start >= slice_end)
-				for span_start, span_end in gutter_vertical_spans
-			)
-			if not has_gutter_char:
-				empty_slices += 1
+        if signals["low_density_ratio"] >= float(self.thresholds["mixed_origin_low_density_page_ratio"]):
+            return OriginType.MIXED
 
-		empty_ratio = empty_slices / slice_count
-		return empty_ratio >= 0.8
+        return OriginType.NATIVE_DIGITAL
 
-	def _detect_domain_hint(self, text: str) -> str:
-		text_lower = text.lower()
-		scores = {
-			domain: 0
-			for domain in self.DOMAIN_KEYWORDS
-		}
+    def _detect_layout_complexity(self, signals: dict[str, Any]) -> LayoutComplexity:
+        if signals["table_page_ratio"] >= float(self.thresholds["table_heavy_density"]):
+            return LayoutComplexity.TABLE_HEAVY
 
-		for domain, keywords in self.DOMAIN_KEYWORDS.items():
-			for keyword in keywords:
-				scores[domain] += text_lower.count(keyword)
+        if (
+            signals["gutter_found"]
+            and signals["avg_chars_per_page"] >= float(self.thresholds["multi_column_min_chars_per_page"])
+        ):
+            return LayoutComplexity.MULTI_COLUMN
 
-		best_domain = max(scores, key=scores.get)
-		if scores[best_domain] == 0:
-			return "general"
+        if (
+            signals["avg_chars_per_page"] >= float(self.thresholds["single_column_min_chars_per_page"])
+            and signals["avg_bbox_density"] >= float(self.thresholds["single_column_min_bbox_density"])
+        ):
+            return LayoutComplexity.SINGLE_COLUMN
 
-		return best_domain
+        return LayoutComplexity.MULTI_COLUMN
 
-	def _estimate_cost(
-		self,
-		origin_type: OriginType,
-		layout_complexity: LayoutComplexity,
-	) -> EstimatedCost:
-		if origin_type == OriginType.SCANNED_IMAGE:
-			return EstimatedCost.NEEDS_VISION_MODEL
-		if layout_complexity == LayoutComplexity.TABLE_HEAVY:
-			return EstimatedCost.NEEDS_LAYOUT_MODEL
-		return EstimatedCost.FAST_TEXT_SUFFICIENT
+    def _has_vertical_gutter(self, chars: list, page_height: float) -> bool:
+        if not chars or page_height <= 0:
+            return False
+
+        gutter_x_min = float(self.thresholds["multi_column_gutter_x_min"])
+        gutter_x_max = float(self.thresholds["multi_column_gutter_x_max"])
+
+        left_char_count = 0
+        right_char_count = 0
+        gutter_vertical_spans: list[tuple[float, float]] = []
+
+        for char in chars:
+            x0 = float(char.get("x0", 0.0) or 0.0)
+            x1 = float(char.get("x1", 0.0) or 0.0)
+            top = float(char.get("top", 0.0) or 0.0)
+            bottom = float(char.get("bottom", top) or top)
+
+            if x1 < gutter_x_min:
+                left_char_count += 1
+            if x0 > gutter_x_max:
+                right_char_count += 1
+
+            intersects_gutter = not (x1 <= gutter_x_min or x0 >= gutter_x_max)
+            if intersects_gutter:
+                span_start = max(0.0, min(top, page_height))
+                span_end = max(0.0, min(bottom, page_height))
+                if span_end > span_start:
+                    gutter_vertical_spans.append((span_start, span_end))
+
+        if left_char_count < int(self.thresholds["multi_column_min_left_chars"]):
+            return False
+        if right_char_count < int(self.thresholds["multi_column_min_right_chars"]):
+            return False
+
+        slice_count = int(self.thresholds["multi_column_slice_count"])
+        slice_height = page_height / slice_count
+        empty_slices = 0
+
+        for idx in range(slice_count):
+            slice_start = idx * slice_height
+            slice_end = slice_start + slice_height
+            has_gutter_char = any(
+                not (span_end <= slice_start or span_start >= slice_end)
+                for span_start, span_end in gutter_vertical_spans
+            )
+            if not has_gutter_char:
+                empty_slices += 1
+
+        empty_ratio = empty_slices / slice_count
+        return empty_ratio >= float(self.thresholds["multi_column_empty_slice_ratio"])
+
+    def _classify_domain(self, text: str) -> str:
+        """Pluggable domain classifier entry point.
+
+        Replace this single method to swap keyword-based classification with VLM/ML.
+        """
+        return self._keyword_domain_classifier(text)
+
+    def _keyword_domain_classifier(self, text: str) -> str:
+        text_lower = (text or "").lower()
+        scores = {domain: 0 for domain in self.domain_keywords}
+
+        for domain, keywords in self.domain_keywords.items():
+            for keyword in keywords:
+                scores[domain] += text_lower.count(str(keyword).lower())
+
+        best_domain = max(scores, key=scores.get) if scores else "general"
+        if not scores or scores[best_domain] == 0:
+            return "general"
+        return best_domain
+
+    def _select_strategy(self, origin_type: OriginType, layout_complexity: LayoutComplexity) -> StrategyTier:
+        if origin_type in {OriginType.SCANNED_IMAGE, OriginType.MIXED}:
+            return StrategyTier.STRATEGY_C
+        if layout_complexity in {LayoutComplexity.TABLE_HEAVY, LayoutComplexity.MULTI_COLUMN}:
+            return StrategyTier.STRATEGY_B
+        return StrategyTier.STRATEGY_A
+
+    def _estimate_cost(self, selected_strategy: StrategyTier) -> float:
+        strategy_to_key = {
+            StrategyTier.STRATEGY_A: "strategy_a",
+            StrategyTier.STRATEGY_B: "strategy_b",
+            StrategyTier.STRATEGY_C: "strategy_c",
+        }
+        return float(self.cost_tiers[strategy_to_key[selected_strategy]])
+
+    def _calculate_confidence(self, signals: dict[str, Any], origin_type: OriginType) -> float:
+        score = float(self.thresholds["confidence_base"])
+
+        scan_like = signals["low_density_ratio"] >= float(self.thresholds["mixed_origin_low_density_page_ratio"])
+        text_rich = signals["text_rich_pages"] > 0
+
+        if signals["has_fonts_any"] and scan_like:
+            score -= float(self.thresholds["confidence_penalty_fonts_but_scan_like"])
+
+        if (not signals["has_fonts_any"]) and text_rich:
+            score -= float(self.thresholds["confidence_penalty_no_fonts_but_text_rich"])
+
+        if signals["has_acroform"] and origin_type != OriginType.NATIVE_DIGITAL:
+            score -= float(self.thresholds["confidence_penalty_form_fillable_scan_like"])
+
+        return max(0.0, min(1.0, round(score, 4)))

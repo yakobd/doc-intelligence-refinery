@@ -1,23 +1,72 @@
-extraction_config:
-  version: "1.0"
+# ==========================================
+# MASTER CONFIGURATION: REFINERY PIPELINE
+# Use this file to tune pipeline behavior
+# without modifying source code.
+# ==========================================
 
-  # Chunking Constitution
-  chunking:
-    method: "semantic_layout"
-    max_tokens: 512
-    overlap: 50
-    respect_table_boundaries: true
-
-  # Extraction Thresholds for Routing
+triage_config:
+  # Thresholds for PDF signal analysis
   thresholds:
-    confidence_escalation_limit: 0.75
-    vision_cost_limit_per_doc: 0.50 # USD
-    high_complexity_table_count: 1
+    scanned_image_char_density: 100 # Low text pages flagged as potential scans
+    mixed_origin_low_density_page_ratio: 0.25 # % of low-text pages to trigger MIXED mode
+    table_heavy_density: 0.15 # % of pages with tables to trigger TABLE_HEAVY
+    single_column_min_chars_per_page: 1200
+    single_column_min_bbox_density: 0.06
+    multi_column_min_chars_per_page: 250
+    multi_column_gutter_x_min: 200 # Horizontal start of search area for column gutters
+    multi_column_gutter_x_max: 400 # Horizontal end of search area for column gutters
+    multi_column_min_left_chars: 80
+    multi_column_min_right_chars: 80
+    multi_column_slice_count: 20
+    multi_column_empty_slice_ratio: 0.8
 
-  # Domain-Specific Rules
-  entity_rules:
+    # Confidence Scoring Penalties
+    confidence_base: 0.9 # Starting score for triage decisions
+    confidence_penalty_fonts_but_scan_like: 0.25
+    confidence_penalty_no_fonts_but_text_rich: 0.3
+    confidence_penalty_form_fillable_scan_like: 0.1
+
+  # Add new domains here to onboard new document types
+  domain_keywords:
     financial:
-      require_currency: true
-      strict_date_parsing: true
-    legal:
-      extract_clauses: true
+      [
+        "balance sheet",
+        "income statement",
+        "audit",
+        "financial report",
+        "revenue",
+      ]
+    legal: ["directive", "proclamation", "regulation", "court", "article"]
+    technical: ["standard", "specification", "architecture", "diagram"]
+    medical: ["patient", "diagnosis", "clinical", "treatment"]
+    technical_legal: ["vulnerability", "procedure", "compliance", "clause"]
+
+  cost_tiers:
+    strategy_a: 0.0
+    strategy_b: 0.02
+    strategy_c: 0.25
+
+# Rubric Item: Chunking Constitution
+# Controls how text is split for downstream LLM/Vector consumption
+chunking_constitution:
+  max_chunk_size: 1000 # Target character count per LDU
+  overlap_size: 200 # Context overlap between chunks
+  semantic_boundaries: [".\n", "\n\n", "###"] # Preferred break points
+
+extraction_config:
+  strategy_c:
+    api_key_env: "OPENROUTER_API_KEY" # Env var name containing provider API key
+    model: "google/gemini-flash-1.5"
+    cost_per_1k_tokens: 0.000125
+    vlm_max_spend_per_doc: 2.00 # HARD BUDGET CAP: USD (used by Strategy C)
+    max_pages_to_process: 3 # Optional cap on pages sent to vision model
+  strategy_a:
+    min_font_threshold: 1
+
+# Rubric Item: Escalation Guard
+# Controls when the router climbs from FastText -> Layout -> Vision
+router_config:
+  escalation_thresholds:
+    min_confidence_a: 0.80 # If FastText < 80%, escalate to Layout
+    min_confidence_b: 0.70 # If Layout < 70%, escalate to Vision
+    min_confidence_final: 0.65 # If Vision < 65%, flag for human review
