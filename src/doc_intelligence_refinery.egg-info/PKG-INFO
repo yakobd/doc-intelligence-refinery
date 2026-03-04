@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: doc-intelligence-refinery
+Version: 0.1.0
+Summary: A multi-strategy document extraction pipeline with automated triage.
+Author-email: Your Name <your.email@example.com>
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pdfplumber>=0.10.0
+Requires-Dist: docling>=1.0.0
+Requires-Dist: rapidocr-onnxruntime>=1.3.0
+Requires-Dist: pyyaml>=6.0.0

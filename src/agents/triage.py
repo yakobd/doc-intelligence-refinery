@@ -1,4 +1,5 @@
 import pdfplumber
+from pathlib import Path
 
 from src.models.document_schema import (
 	DocumentProfile,
@@ -54,6 +55,8 @@ class TriageAgent:
 		Returns:
 			A populated DocumentProfile based on first-page heuristics.
 		"""
+		filename = Path(pdf_path).name
+
 		with pdfplumber.open(pdf_path) as pdf:
 			if not pdf.pages:
 				origin_type = OriginType.SCANNED_IMAGE
@@ -61,6 +64,7 @@ class TriageAgent:
 				domain_hint = "general"
 				estimated_cost = EstimatedCost.NEEDS_VISION_MODEL
 				return DocumentProfile(
+					filename=filename,
 					origin_type=origin_type,
 					layout_complexity=layout_complexity,
 					language="en",
@@ -90,6 +94,7 @@ class TriageAgent:
 			_ = page_area
 
 			return DocumentProfile(
+				filename=filename,
 				origin_type=origin_type,
 				layout_complexity=layout_complexity,
 				language="en",

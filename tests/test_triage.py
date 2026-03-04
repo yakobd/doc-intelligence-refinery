@@ -3,7 +3,7 @@ import os
 # Ensure the src directory is in the path so we can import our modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.agents.triage_agent import TriageAgent
+from src.agents.triage import TriageAgent
 
 def run_triage_audit():
     agent = TriageAgent()

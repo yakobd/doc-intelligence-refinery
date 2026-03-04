@@ -1,0 +1,23 @@
+extraction_config:
+  version: "1.0"
+
+  # Chunking Constitution
+  chunking:
+    method: "semantic_layout"
+    max_tokens: 512
+    overlap: 50
+    respect_table_boundaries: true
+
+  # Extraction Thresholds for Routing
+  thresholds:
+    confidence_escalation_limit: 0.75
+    vision_cost_limit_per_doc: 0.50 # USD
+    high_complexity_table_count: 1
+
+  # Domain-Specific Rules
+  entity_rules:
+    financial:
+      require_currency: true
+      strict_date_parsing: true
+    legal:
+      extract_clauses: true
