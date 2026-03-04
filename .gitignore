@@ -1,0 +1,7 @@
+echo "node_modules/
+__pycache__/
+.env
+data/
+.refinery/
+*.pdf
+.venv/" > .gitignore
