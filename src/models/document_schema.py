@@ -86,6 +86,8 @@ class DocumentProfile(BaseModel):
     pages: int
     language: str = "en"
     domain_hint: str = "financial"
+    is_form_fillable: bool = False
+    domain_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 # 7. Normalized Extraction Output
 class NormalizedOutput(BaseModel):

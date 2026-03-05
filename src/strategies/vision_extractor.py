@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class StrategyC(BaseStrategy):
     """Vision-assisted extraction strategy for scanned or difficult PDFs."""
 
-    COST_PER_PAGE = 0.01
+    DEFAULT_COST_PER_PAGE = 0.01
     DEFAULT_MODEL = "google/gemini-flash-1.5"
     OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -42,6 +42,7 @@ class StrategyC(BaseStrategy):
                 strategy_config.get("max_budget_per_doc", 0.5),
             )
         )
+        self.cost_per_page = float(strategy_config.get("cost_per_page", self.DEFAULT_COST_PER_PAGE))
         self.max_pages_to_process = int(strategy_config.get("max_pages_to_process", 3))
         self.default_model = str(strategy_config.get("model", self.DEFAULT_MODEL))
         self.api_key_env = str(strategy_config.get("api_key_env", "OPENROUTER_API_KEY"))
@@ -60,7 +61,7 @@ class StrategyC(BaseStrategy):
             logger.exception("StrategyC failed to open PDF, returning partial output: %s", open_error)
             return self._partial_output(filename=filename, doc_id=doc_id, profile=profile, warnings=[str(open_error)])
 
-        projected_cost = total_pages * self.COST_PER_PAGE
+        projected_cost = total_pages * self.cost_per_page
         if projected_cost > self.max_budget:
             raise ValueError(
                 f"Budget exceeded for {filename}: projected ${projected_cost:.2f} > max ${self.max_budget:.2f}"
@@ -76,7 +77,7 @@ class StrategyC(BaseStrategy):
 
         metadata: dict[str, Any] = {
             "selected_strategy": profile.selected_strategy.value,
-            "avg_confidence": 0.85,
+            "avg_confidence": float(self.config.get("router_config", {}).get("default_fallback_confidence", 0.85)),
             "provenance_chain": provenance_items,
         }
         if warnings:

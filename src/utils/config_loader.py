@@ -24,6 +24,8 @@ def default_config() -> dict[str, Any]:
             "thresholds": {
                 "scanned_image_char_density": 100,
                 "mixed_origin_low_density_page_ratio": 0.25,
+                "mixed_mode_ratio": 0.25,
+                "high_font_density_char_count": 200,
                 "table_heavy_density": 0.15,
                 "single_column_min_chars_per_page": 1200,
                 "single_column_min_bbox_density": 0.06,
@@ -65,6 +67,7 @@ def default_config() -> dict[str, Any]:
                 "api_key_env": "OPENROUTER_API_KEY",
                 "model": "google/gemini-flash-1.5",
                 "cost_per_1k_tokens": 0.000125,
+                "cost_per_page": 0.01,
                 "vlm_max_spend_per_doc": 0.5,
                 "max_pages_to_process": 3,
             },

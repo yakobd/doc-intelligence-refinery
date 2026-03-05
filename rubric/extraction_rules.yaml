@@ -9,6 +9,8 @@ triage_config:
   thresholds:
     scanned_image_char_density: 100 # Low text pages flagged as potential scans
     mixed_origin_low_density_page_ratio: 0.25 # % of low-text pages to trigger MIXED mode
+    mixed_mode_ratio: 0.25 # Canonical mixed-mode threshold (used by triage origin detection)
+    high_font_density_char_count: 200 # Page is considered high-font-density when font-bearing chars exceed this value
     table_heavy_density: 0.15 # % of pages with tables to trigger TABLE_HEAVY
     single_column_min_chars_per_page: 1200
     single_column_min_bbox_density: 0.06
@@ -58,6 +60,7 @@ extraction_config:
     api_key_env: "OPENROUTER_API_KEY" # Env var name containing provider API key
     model: "google/gemini-flash-1.5"
     cost_per_1k_tokens: 0.000125
+    cost_per_page: 0.01 # Used for per-document projected spend guardrail
     vlm_max_spend_per_doc: 2.00 # HARD BUDGET CAP: USD (used by Strategy C)
     max_pages_to_process: 3 # Optional cap on pages sent to vision model
   strategy_a:
@@ -66,6 +69,7 @@ extraction_config:
 # Rubric Item: Escalation Guard
 # Controls when the router climbs from FastText -> Layout -> Vision
 router_config:
+  default_fallback_confidence: 0.85 # Used when avg_confidence metadata is unavailable but LDUs exist
   escalation_thresholds:
     min_confidence_a: 0.80 # If FastText < 80%, escalate to Layout
     min_confidence_b: 0.70 # If Layout < 70%, escalate to Vision

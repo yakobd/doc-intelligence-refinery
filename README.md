@@ -64,3 +64,21 @@ The implemented pipeline produces rubric-required evidence outputs, including:
 - A persistent extraction ledger at `.refinery/extraction_ledger.jsonl` that records timestamp, filename, strategy used, average confidence, and estimated extraction cost.
 
 These artifacts provide auditable proof of triage decisions and extraction execution quality.
+
+## 🚀 Onboarding & Extensibility
+
+This pipeline is designed for **Onboarding Readiness**: adding a new document domain (for example, Medical, Legal, or HR) requires **zero Python code changes**.
+
+### How to onboard a new domain
+
+- Open `rubric/extraction_rules.yaml`.
+- Navigate to `triage_config -> domain_keywords`.
+- Add a new domain key (for example, `hr`) and include representative keywords for that domain.
+- If needed, tune `triage_config -> thresholds` to adjust triage sensitivity for your document mix.
+- If needed, update `triage_config -> cost_tiers` to reflect expected extraction cost behavior.
+
+### Why this works without code edits
+
+- `TriageAgent` reads triage rules from `rubric/extraction_rules.yaml` through the centralized config loader at runtime.
+- `KeywordDomainClassifier` (implementing the `BaseDomainClassifier` strategy contract) consumes the configured `domain_keywords` dictionary dynamically.
+- Because classification behavior is configuration-driven, new domains become active immediately after config updates.

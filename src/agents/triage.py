@@ -4,6 +4,7 @@ import logging
 
 import pdfplumber
 
+from src.agents.domain_classifier import BaseDomainClassifier, KeywordDomainClassifier
 from src.models.document_schema import (
     DocumentProfile,
     LayoutComplexity,
@@ -19,12 +20,27 @@ logger = logging.getLogger(__name__)
 class TriageAgent:
     """Profiles documents and routes them toward an extraction strategy."""
 
-    def __init__(self, config: dict[str, Any] | None = None, config_path: str = "rubric/extraction_rules.yaml") -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        config_path: str = "rubric/extraction_rules.yaml",
+        domain_classifier: BaseDomainClassifier | None = None,
+    ) -> None:
         self.config = config or load_config(config_path)
         self.rules = self._load_rules()
         self.thresholds = self.rules["thresholds"]
         self.domain_keywords = self.rules["domain_keywords"]
         self.cost_tiers = self.rules["cost_tiers"]
+        self.mixed_mode_ratio = float(
+            self.thresholds.get(
+                "mixed_mode_ratio",
+                self.thresholds.get("mixed_origin_low_density_page_ratio", 0.25),
+            )
+        )
+        self.high_font_density_char_count = int(self.thresholds.get("high_font_density_char_count", 200))
+        self.domain_classifier = domain_classifier or KeywordDomainClassifier(self.domain_keywords)
+
+
     def profile_document(self, pdf_path: str) -> DocumentProfile:
         filename = Path(pdf_path).name
 
@@ -33,10 +49,10 @@ class TriageAgent:
 
         origin_type = self._detect_origin(signals)
         layout_complexity = self._detect_layout_complexity(signals)
-        domain_hint = self._classify_domain(signals["combined_text"])
+        domain_hint, domain_confidence = self.domain_classifier.classify(signals["combined_text"])
         selected_strategy = self._select_strategy(origin_type, layout_complexity)
         confidence_score = self._calculate_confidence(signals, origin_type)
-        estimated_cost = self._estimate_cost(selected_strategy)
+        estimated_cost = self._estimate_cost(selected_strategy, signals["total_pages"])
 
         return DocumentProfile(
             filename=filename,
@@ -48,6 +64,8 @@ class TriageAgent:
             pages=signals["total_pages"],
             language="en",
             domain_hint=domain_hint,
+            is_form_fillable=signals["has_acroform"],
+            domain_confidence=domain_confidence,
         )
 
     def _load_rules(self) -> dict[str, Any]:
@@ -76,6 +94,8 @@ class TriageAgent:
                 "combined_text": "",
                 "has_acroform": self._has_acroform(pdf),
                 "text_rich_pages": 0,
+                "zero_font_pages": [1],
+                "high_font_density_pages": [],
             }
 
         combined_text_parts: list[str] = []
@@ -87,8 +107,10 @@ class TriageAgent:
         total_chars = 0
         total_bbox_density = 0.0
         gutter_found = False
+        zero_font_pages: list[int] = []
+        high_font_density_pages: list[int] = []
 
-        for page in pdf.pages:
+        for page_index, page in enumerate(pdf.pages, start=1):
             try:
                 text = page.extract_text() or ""
                 combined_text_parts.append(text)
@@ -97,8 +119,14 @@ class TriageAgent:
                 total_chars += char_count
 
                 chars = page.objects.get("char", [])
-                if any(char.get("fontname") for char in chars):
+                font_chars_count = sum(1 for char in chars if char.get("fontname"))
+                if font_chars_count > 0:
                     fonts_detected_pages += 1
+                else:
+                    zero_font_pages.append(page_index)
+
+                if font_chars_count >= self.high_font_density_char_count:
+                    high_font_density_pages.append(page_index)
 
                 if char_count <= float(self.thresholds["scanned_image_char_density"]):
                     low_density_pages += 1
@@ -142,19 +170,51 @@ class TriageAgent:
             "combined_text": "\n".join(combined_text_parts),
             "has_acroform": self._has_acroform(pdf),
             "text_rich_pages": text_rich_pages,
+            "zero_font_pages": zero_font_pages,
+            "high_font_density_pages": high_font_density_pages,
         }
 
     def _has_acroform(self, pdf: pdfplumber.PDF) -> bool:
-        catalog = getattr(getattr(pdf, "doc", None), "catalog", {}) or {}
-        return ("AcroForm" in catalog) or ("/AcroForm" in catalog)
+        doc = getattr(pdf, "doc", None)
+        catalog = getattr(doc, "catalog", {}) or {}
+        trailer = getattr(doc, "trailer", {}) or {}
+
+        if "AcroForm" in catalog or "/AcroForm" in catalog:
+            return True
+
+        root = trailer.get("Root") if isinstance(trailer, dict) else None
+        if root is None:
+            root = trailer.get("/Root") if isinstance(trailer, dict) else None
+
+        if isinstance(root, dict):
+            return ("AcroForm" in root) or ("/AcroForm" in root)
+
+        for attr in ("get",):
+            getter = getattr(root, attr, None)
+            if callable(getter):
+                if getter("AcroForm") is not None or getter("/AcroForm") is not None:
+                    return True
+
+        return False
 
     def _detect_origin(self, signals: dict[str, Any]) -> OriginType:
+        zero_font_pages = signals.get("zero_font_pages", [])
+        high_font_density_pages = signals.get("high_font_density_pages", [])
+
+        if zero_font_pages and high_font_density_pages:
+            logger.info(
+                "Mixed-mode document detected with zero-font pages=%s and high-font pages=%s",
+                self._compress_page_ranges(zero_font_pages),
+                self._compress_page_ranges(high_font_density_pages),
+            )
+            return OriginType.MIXED
+
         if not signals["has_fonts_any"]:
             if signals["has_acroform"]:
                 return OriginType.MIXED
             return OriginType.SCANNED_IMAGE
 
-        if signals["low_density_ratio"] >= float(self.thresholds["mixed_origin_low_density_page_ratio"]):
+        if signals["low_density_ratio"] >= self.mixed_mode_ratio:
             return OriginType.MIXED
 
         return OriginType.NATIVE_DIGITAL
@@ -233,20 +293,7 @@ class TriageAgent:
 
         Replace this single method to swap keyword-based classification with VLM/ML.
         """
-        return self._keyword_domain_classifier(text)
-
-    def _keyword_domain_classifier(self, text: str) -> str:
-        text_lower = (text or "").lower()
-        scores = {domain: 0 for domain in self.domain_keywords}
-
-        for domain, keywords in self.domain_keywords.items():
-            for keyword in keywords:
-                scores[domain] += text_lower.count(str(keyword).lower())
-
-        best_domain = max(scores, key=scores.get) if scores else "general"
-        if not scores or scores[best_domain] == 0:
-            return "general"
-        return best_domain
+        return self.domain_classifier.classify(text)
 
     def _select_strategy(self, origin_type: OriginType, layout_complexity: LayoutComplexity) -> StrategyTier:
         if origin_type in {OriginType.SCANNED_IMAGE, OriginType.MIXED}:
@@ -255,13 +302,14 @@ class TriageAgent:
             return StrategyTier.STRATEGY_B
         return StrategyTier.STRATEGY_A
 
-    def _estimate_cost(self, selected_strategy: StrategyTier) -> float:
+    def _estimate_cost(self, selected_strategy: StrategyTier, pages: int) -> float:
         strategy_to_key = {
             StrategyTier.STRATEGY_A: "strategy_a",
             StrategyTier.STRATEGY_B: "strategy_b",
             StrategyTier.STRATEGY_C: "strategy_c",
         }
-        return float(self.cost_tiers[strategy_to_key[selected_strategy]])
+        base_tier = float(self.cost_tiers[strategy_to_key[selected_strategy]])
+        return round(max(1, int(pages)) * base_tier, 4)
 
     def _calculate_confidence(self, signals: dict[str, Any], origin_type: OriginType) -> float:
         score = float(self.thresholds["confidence_base"])
@@ -279,3 +327,31 @@ class TriageAgent:
             score -= float(self.thresholds["confidence_penalty_form_fillable_scan_like"])
 
         return max(0.0, min(1.0, round(score, 4)))
+
+    def _compress_page_ranges(self, pages: list[int]) -> str:
+        if not pages:
+            return "none"
+
+        ordered = sorted(set(pages))
+        ranges: list[str] = []
+        start = ordered[0]
+        end = ordered[0]
+
+        for page in ordered[1:]:
+            if page == end + 1:
+                end = page
+                continue
+
+            if start == end:
+                ranges.append(str(start))
+            else:
+                ranges.append(f"{start}-{end}")
+            start = page
+            end = page
+
+        if start == end:
+            ranges.append(str(start))
+        else:
+            ranges.append(f"{start}-{end}")
+
+        return ",".join(ranges)

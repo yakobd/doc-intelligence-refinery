@@ -244,14 +244,21 @@ class ExtractionRouter:
         if not extracted.ldus:
             return 0.0
 
-        return 0.85
+        router_cfg = get_router_config(self.config)
+        fallback_confidence = 0.0
+        if isinstance(router_cfg, dict):
+            value = router_cfg.get("default_fallback_confidence")
+            if isinstance(value, (int, float)):
+                fallback_confidence = float(value)
+
+        return round(fallback_confidence, 4)
 
     def _estimated_cost(self, extracted: NormalizedOutput) -> float:
         selected_strategy = extracted.metadata.get("selected_strategy", extracted.profile.selected_strategy.value)
         if selected_strategy == StrategyTier.STRATEGY_C.value:
             unique_pages = {page for ldu in extracted.ldus for page in ldu.page_refs}
             pages_count = len(unique_pages) if unique_pages else max(1, extracted.profile.pages)
-            return round(pages_count * StrategyC.COST_PER_PAGE, 4)
+            return round(pages_count * float(self.strategy_c.cost_per_page), 4)
         return 0.0
 
     def _ensure_recursive_index(self, extracted: NormalizedOutput) -> NormalizedOutput:
