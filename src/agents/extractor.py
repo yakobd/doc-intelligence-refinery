@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 from src.agents.triage import TriageAgent
 from src.models.document_schema import (
     DocumentProfile,
@@ -42,42 +44,88 @@ class ExtractionRouter:
     """Coordinates triage, strategy routing, extraction, escalation, and ledger logging."""
 
     def __init__(self, config: dict[str, Any] | None = None, config_path: str = "rubric/extraction_rules.yaml") -> None:
-        os.makedirs("logs", exist_ok=True)
+        project_root = Path(__file__).resolve().parents[2]
+        load_dotenv(dotenv_path=project_root / ".env")
+        logs_dir = project_root / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        self.ledger_path = logs_dir / "extraction_ledger.csv"
         self.config = config or load_config(config_path)
         self.triage_agent = TriageAgent(config=self.config, config_path=config_path)
         self.strategy_a = StrategyA(config=self.config)
         self.strategy_b = StrategyB(config=self.config)
         self.strategy_c = StrategyC(config=self.config)
-        self.ledger = ExtractionLedger("logs/extraction_ledger.jsonl")
+        self.ledger = ExtractionLedger(str(self.ledger_path))
         self.escalation_thresholds = self._load_escalation_thresholds()
 
     def process_document(self, pdf_path: str) -> NormalizedOutput:
+        print(f"[process_document] Starting extraction for: {pdf_path}")
         escalation_history: list[dict[str, Any]] = []
         total_processing_time = 0.0
 
+        print("[process_document] Attempting LLM extraction initialization...")
+        llm_ready = False
         try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            google_api_key = os.getenv("GOOGLE_API_KEY")
+            if not (google_api_key or "").strip():
+                raise ValueError("GOOGLE_API_KEY is not set")
+
+            model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+            while model_name.startswith("models/"):
+                model_name = model_name[len("models/") :]
+
+            _ = ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=os.getenv("GOOGLE_API_KEY"),
+                temperature=0,
+                disable_streaming=True,
+            )
+            llm_ready = True
+            print("[process_document] LLM initialization successful.")
+        except Exception as llm_error:
+            print(f"[process_document] LLM initialization failed: {llm_error}")
+            print("[process_document] Falling back to PyMuPDF extraction path.")
+
+        if not llm_ready:
+            fallback_profile = self._fallback_profile(pdf_path)
+            return self._fallback_ldus_from_pymupdf(
+                pdf_path=pdf_path,
+                profile=fallback_profile,
+                warning_message="LLM initialization failed; used PyMuPDF fallback extraction.",
+            )
+
+        try:
+            print("[process_document] Running triage...")
             profile = self.triage_agent.profile_document(pdf_path)
             self._save_profile_artifact(profile)
+            print(
+                "[process_document] Triage complete | "
+                f"strategy={profile.selected_strategy.value} | pages={profile.pages}"
+            )
             logger.info("Triage completed for %s | selected=%s", profile.filename, profile.selected_strategy.value)
         except BaseException as triage_error:
             logger.exception("Triage failed for %s. Returning partial output.", pdf_path)
             fallback_profile = self._fallback_profile(pdf_path)
-            extracted = self._partial_output_from_error(
+            print(f"[process_document] Triage failed: {triage_error}")
+            return self._fallback_ldus_from_pymupdf(
+                pdf_path=pdf_path,
                 profile=fallback_profile,
-                error_message=f"Triage failed: {triage_error}",
-                escalation_history=escalation_history,
+                warning_message=f"Triage failed: {triage_error}. Used PyMuPDF fallback extraction.",
             )
-            extracted.metadata["processing_time"] = 0.0
-            self._save_extraction_artifact(extracted)
-            self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
-            return extracted
 
         selected_strategy = profile.selected_strategy
 
         # Initial strategy execution based on triage decision
+        print(f"[process_document] Executing primary strategy: {selected_strategy.value}")
         extracted, current_processing_time = self._run_strategy(selected_strategy, pdf_path, profile, escalation_history)
         total_processing_time += current_processing_time
+        print(
+            "[process_document] Primary strategy finished | "
+            f"ldus={len(extracted.ldus)} | processing_time={current_processing_time}s"
+        )
         if self._is_budget_exceeded_output(extracted):
+            print("[process_document] Budget guard triggered; returning budget-exceeded output.")
             extracted.profile = extracted.profile.model_copy(update={"selected_strategy": StrategyTier.STRATEGY_C})
             extracted.metadata["selected_strategy"] = StrategyTier.STRATEGY_C.value
             extracted.metadata["escalation_history"] = escalation_history
@@ -94,6 +142,10 @@ class ExtractionRouter:
             action_a = "kept"
             if confidence_a < float(self.escalation_thresholds["min_confidence_a"]):
                 action_a = "escalated"
+                print(
+                    "[process_document] Escalating A -> B | "
+                    f"confidence={confidence_a:.4f} threshold={float(self.escalation_thresholds['min_confidence_a']):.4f}"
+                )
                 logger.info(
                     "Escalation decision for %s: FASTTEXT confidence %.4f < %.4f, escalating to LAYOUT",
                     profile.filename,
@@ -108,6 +160,7 @@ class ExtractionRouter:
                 )
                 total_processing_time += current_processing_time
                 if self._is_budget_exceeded_output(extracted):
+                    print("[process_document] Budget guard triggered during escalation to B.")
                     extracted.profile = extracted.profile.model_copy(update={"selected_strategy": StrategyTier.STRATEGY_C})
                     extracted.metadata["selected_strategy"] = StrategyTier.STRATEGY_C.value
                     extracted.metadata["escalation_history"] = escalation_history
@@ -132,6 +185,10 @@ class ExtractionRouter:
             action_b = "kept"
             if confidence_b < float(self.escalation_thresholds["min_confidence_b"]):
                 action_b = "escalated"
+                print(
+                    "[process_document] Escalating B -> C | "
+                    f"confidence={confidence_b:.4f} threshold={float(self.escalation_thresholds['min_confidence_b']):.4f}"
+                )
                 logger.info(
                     "Escalation decision for %s: LAYOUT confidence %.4f < %.4f, escalating to VISION",
                     profile.filename,
@@ -146,6 +203,7 @@ class ExtractionRouter:
                 )
                 total_processing_time += current_processing_time
                 if self._is_budget_exceeded_output(extracted):
+                    print("[process_document] Budget guard triggered during escalation to C.")
                     extracted.profile = extracted.profile.model_copy(update={"selected_strategy": StrategyTier.STRATEGY_C})
                     extracted.metadata["selected_strategy"] = StrategyTier.STRATEGY_C.value
                     extracted.metadata["escalation_history"] = escalation_history
@@ -194,6 +252,218 @@ class ExtractionRouter:
 
         extracted = self._refine_ldu_granularity(extracted)
         extracted = self._ensure_recursive_index(extracted)
+
+        if not extracted.ldus:
+            print("[process_document] Strategy pipeline returned zero LDUs; using PyMuPDF fallback.")
+            return self._fallback_ldus_from_pymupdf(
+                pdf_path=pdf_path,
+                profile=profile,
+                warning_message="Primary extraction produced no LDUs; used PyMuPDF fallback extraction.",
+            )
+
+        total_text_length = sum(len((ldu.content or "").strip()) for ldu in extracted.ldus)
+        print(f"[process_document] Raw text length found: {total_text_length}")
+        print(f"[process_document] Final LDU count: {len(extracted.ldus)}")
+
+        self._save_extraction_artifact(extracted)
+        self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
+        return extracted
+
+    def _fallback_ldus_from_pymupdf(
+        self,
+        pdf_path: str,
+        profile: DocumentProfile,
+        warning_message: str,
+    ) -> NormalizedOutput:
+        print("[process_document] Entering PyMuPDF fallback extraction...")
+        try:
+            import fitz  # PyMuPDF
+        except Exception as fitz_error:
+            logger.exception("PyMuPDF import failed during fallback for %s", pdf_path)
+            print(f"[process_document] PyMuPDF import failed: {fitz_error}")
+            extracted = self._partial_output_from_error(
+                profile=profile,
+                error_message=f"{warning_message} PyMuPDF import failed: {fitz_error}",
+                escalation_history=[],
+            )
+            extracted.metadata["processing_time"] = 0.0
+            self._save_extraction_artifact(extracted)
+            self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
+            return extracted
+
+        filename = Path(pdf_path).name
+        doc_id = Path(pdf_path).stem
+        ldus: list[LDU] = []
+        index_nodes: list[PageIndexNode] = []
+        provenance_items: list[dict[str, Any]] = []
+        total_text_length = 0
+
+        try:
+            with fitz.open(pdf_path) as doc:
+                for page_idx in range(len(doc)):
+                    page_number = page_idx + 1
+                    page = doc[page_idx]
+                    page_text = (page.get_text("text") or "").strip()
+
+                    if not page_text:
+                        print(
+                            "[process_document] Fallback page text empty from get_text('text') | "
+                            f"page={page_number}. Trying blocks..."
+                        )
+                        try:
+                            blocks = page.get_text("blocks") or []
+                            block_texts: list[str] = []
+                            for block in blocks:
+                                if isinstance(block, (list, tuple)) and len(block) >= 5:
+                                    text_part = str(block[4] or "").strip()
+                                    if text_part:
+                                        block_texts.append(text_part)
+                                elif isinstance(block, dict):
+                                    text_part = str(block.get("text", "")).strip()
+                                    if text_part:
+                                        block_texts.append(text_part)
+                            page_text = "\n".join(block_texts).strip()
+                        except Exception as blocks_error:
+                            print(
+                                "[process_document] get_text('blocks') failed | "
+                                f"page={page_number} error={blocks_error}"
+                            )
+
+                    if not page_text:
+                        try:
+                            pix = page.get_pixmap(alpha=False)
+                            if pix.width > 0 and pix.height > 0:
+                                print("Page appears to be an image.")
+                                print(
+                                    "[process_document] No extractable text found; "
+                                    f"page={page_number} pixmap={pix.width}x{pix.height}"
+                                )
+                        except Exception as pix_error:
+                            print(
+                                "[process_document] get_pixmap() failed during image check | "
+                                f"page={page_number} error={pix_error}"
+                            )
+
+                    # Normalize whitespace to keep chunk quality and hash stability.
+                    page_text = re.sub(r"\s+", " ", (page_text or "")).strip()
+
+                    page_text_length = len(page_text)
+                    total_text_length += page_text_length
+                    print(
+                        "[process_document] Fallback page read | "
+                        f"page={page_number} text_len={page_text_length}"
+                    )
+
+                    if not page_text:
+                        index_nodes.append(
+                            PageIndexNode(
+                                title=f"Page {page_number}",
+                                page_start=page_number,
+                                page_end=page_number,
+                                children=[],
+                            )
+                        )
+                        continue
+
+                    chunk_size = 1000
+                    page_chunks = [
+                        page_text[i : i + chunk_size].strip()
+                        for i in range(0, len(page_text), chunk_size)
+                        if page_text[i : i + chunk_size].strip()
+                    ]
+
+                    for chunk_idx, chunk_text in enumerate(page_chunks, start=1):
+                        normalized_chunk = re.sub(r"\s+", " ", (chunk_text or "")).strip()
+                        if not normalized_chunk:
+                            continue
+
+                        # Include text + page context for uniqueness across repeated values.
+                        chunk_hash = hashlib.sha256(
+                            f"{normalized_chunk}|{filename}|{page_number}|{chunk_idx}".encode("utf-8")
+                        ).hexdigest()
+                        bbox = [0.0, 0.0, 0.0, 0.0]
+
+                        ldus.append(
+                            LDU(
+                                uid=f"{doc_id}-p{page_number:03d}-fallback-{chunk_idx:03d}",
+                                chunk_type="paragraph",
+                                content=normalized_chunk,
+                                content_hash=chunk_hash,
+                                page_refs=[page_number],
+                                bounding_box=bbox,
+                                parent_section=f"page-{page_number}",
+                                token_count=len(normalized_chunk.split()),
+                                child_chunks=[normalized_chunk],
+                            )
+                        )
+                        provenance_items.append(
+                            {
+                                "document_name": filename,
+                                "page_number": page_number,
+                                "bbox": bbox,
+                                "content_hash": chunk_hash,
+                            }
+                        )
+
+                    index_nodes.append(
+                        PageIndexNode(
+                            title=f"Page {page_number}",
+                            page_start=page_number,
+                            page_end=page_number,
+                            children=[],
+                        )
+                    )
+        except Exception as fallback_error:
+            logger.exception("PyMuPDF fallback failed for %s", pdf_path)
+            print(f"[process_document] PyMuPDF fallback failed: {fallback_error}")
+            extracted = self._partial_output_from_error(
+                profile=profile,
+                error_message=f"{warning_message} PyMuPDF extraction failed: {fallback_error}",
+                escalation_history=[],
+            )
+            extracted.metadata["processing_time"] = 0.0
+            self._save_extraction_artifact(extracted)
+            self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
+            return extracted
+
+        print(f"[process_document] Raw text length found: {total_text_length}")
+        print(f"[process_document] Fallback LDU count: {len(ldus)}")
+
+        if not ldus and total_text_length > 0:
+            # Safety net: if text exists but chunking produced no LDUs.
+            chunk_hash = hashlib.sha256(f"{doc_id}|fallback".encode("utf-8")).hexdigest()
+            ldus.append(
+                LDU(
+                    uid=f"{doc_id}-fallback-001",
+                    chunk_type="paragraph",
+                    content="Recovered text was detected but could not be chunked.",
+                    content_hash=chunk_hash,
+                    page_refs=[1],
+                    bounding_box=[0.0, 0.0, 0.0, 0.0],
+                    parent_section="page-1",
+                    token_count=9,
+                    child_chunks=["Recovered text was detected but could not be chunked."],
+                )
+            )
+
+        extracted = NormalizedOutput(
+            filename=filename,
+            doc_id=doc_id,
+            profile=profile,
+            ldus=ldus,
+            index=index_nodes if index_nodes else [PageIndexNode(title="Page 1", page_start=1, page_end=1, children=[])],
+            metadata={
+                "selected_strategy": profile.selected_strategy.value,
+                "avg_confidence": 0.6,
+                "provenance_chain": provenance_items,
+                "warning": warning_message,
+                "requires_human_review": False,
+                "escalation_history": [],
+                "processing_time": 0.0,
+                "source_filename": filename,
+                "fallback_pages_processed": len(index_nodes),
+            },
+        )
         self._save_extraction_artifact(extracted)
         self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
         return extracted

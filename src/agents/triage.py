@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 import logging
+import os
 
 import pdfplumber
 
@@ -40,6 +41,7 @@ class TriageAgent:
         self.high_font_density_char_count = int(self.thresholds.get("high_font_density_char_count", 200))
         self.scanned_char_density_per_area = float(self.thresholds.get("scanned_char_density_per_area", 0.0002))
         self.table_to_text_ratio_threshold = float(self.thresholds.get("table_to_text_ratio_threshold", 0.2))
+        self.scan_chars_per_page_threshold = float(self.thresholds.get("scan_chars_per_page_threshold", 150))
         self.domain_classifier = domain_classifier or KeywordDomainClassifier(self.domain_keywords)
 
 
@@ -52,14 +54,24 @@ class TriageAgent:
         origin_type = self._detect_origin(signals)
         layout_complexity = self._detect_layout_complexity(signals)
         domain_hint, domain_confidence = self._classify_domain(signals["combined_text"])
-        selected_strategy = self._select_strategy(origin_type, layout_complexity)
-        confidence_score = self._calculate_confidence(signals, origin_type)
         estimated_chars = int(signals.get("estimated_chars", 0))
+        selected_strategy = self._select_strategy(
+            origin_type=origin_type,
+            layout_complexity=layout_complexity,
+            signals=signals,
+            estimated_chars=estimated_chars,
+            pages=signals["total_pages"],
+        )
+        confidence_score = self._calculate_confidence(signals, origin_type)
         estimated_cost = self._estimate_cost(
             selected_strategy=selected_strategy,
             estimated_chars=estimated_chars,
             pages=signals["total_pages"],
         )
+
+        if selected_strategy == StrategyTier.STRATEGY_B:
+            # Ensure layout strategy can use Docling path without manual env toggling.
+            os.environ["ENABLE_DOCLING_ADAPTER"] = "1"
 
         return DocumentProfile(
             filename=filename,
@@ -190,6 +202,7 @@ class TriageAgent:
             "avg_char_density": total_char_density / total_pages,
             "avg_bbox_density": total_bbox_density / total_pages,
             "table_page_ratio": table_pages / total_pages,
+            "table_pages": table_pages,
             "table_to_text_ratio": (total_table_chars / max(1, total_chars)),
             "gutter_found": gutter_found,
             "combined_text": "\n".join(combined_text_parts),
@@ -333,11 +346,27 @@ class TriageAgent:
         confidence = float(domain_confidence) if isinstance(domain_confidence, (int, float)) else 0.0
         return domain, max(0.0, min(1.0, round(confidence, 4)))
 
-    def _select_strategy(self, origin_type: OriginType, layout_complexity: LayoutComplexity) -> StrategyTier:
+    def _select_strategy(
+        self,
+        origin_type: OriginType,
+        layout_complexity: LayoutComplexity,
+        signals: dict[str, Any],
+        estimated_chars: int,
+        pages: int,
+    ) -> StrategyTier:
+        # Threshold detection for likely scanned documents (from YAML-configurable heuristic).
+        safe_pages = max(1, int(pages))
+        chars_per_page = float(max(0, int(estimated_chars))) / float(safe_pages)
+        if chars_per_page < self.scan_chars_per_page_threshold:
+            return StrategyTier.STRATEGY_C
+
         if origin_type in {OriginType.SCANNED_IMAGE, OriginType.MIXED}:
             return StrategyTier.STRATEGY_C
-        if layout_complexity in {LayoutComplexity.TABLE_HEAVY, LayoutComplexity.MULTI_COLUMN}:
+
+        table_pages = int(signals.get("table_pages", 0) or 0)
+        if layout_complexity in {LayoutComplexity.TABLE_HEAVY, LayoutComplexity.MULTI_COLUMN} or table_pages >= 2:
             return StrategyTier.STRATEGY_B
+
         return StrategyTier.STRATEGY_A
 
     def _estimate_cost(self, selected_strategy: StrategyTier, estimated_chars: int, pages: int) -> float:

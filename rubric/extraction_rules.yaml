@@ -8,6 +8,7 @@ triage_config:
   # Thresholds for PDF signal analysis
   thresholds:
     scanned_image_char_density: 100 # Low text pages flagged as potential scans
+    scan_chars_per_page_threshold: 150 # If estimated_chars/pages is below this, triage routes to Strategy C
     mixed_origin_low_density_page_ratio: 0.25 # % of low-text pages to trigger MIXED mode
     mixed_mode_ratio: 0.25 # Canonical mixed-mode threshold (used by triage origin detection)
     high_font_density_char_count: 200 # Page is considered high-font-density when font-bearing chars exceed this value
@@ -44,9 +45,9 @@ triage_config:
     technical_legal: ["vulnerability", "procedure", "compliance", "clause"]
 
   cost_tiers:
-    strategy_a: 0.0
-    strategy_b: 0.02
-    strategy_c: 0.25
+    strategy_a: 0.0 # Triage cost model: cost per million chars
+    strategy_b: 0.02 # Triage cost model: cost per million chars
+    strategy_c: 0.25 # Triage cost model: cost per million chars
 
 # Rubric Item: Chunking Constitution
 # Controls how text is split for downstream LLM/Vector consumption
@@ -54,6 +55,21 @@ chunking_constitution:
   max_chunk_size: 1000 # Target character count per LDU
   overlap_size: 200 # Context overlap between chunks
   semantic_boundaries: [".\n", "\n\n", "###"] # Preferred break points
+  table_cells:
+    preserve_row_integrity: true # Keep all cells from the same row together when possible
+    include_headers_in_each_chunk: true # Repeat table headers for every split table chunk
+    min_cells_per_chunk: 1 # Never emit empty table chunks
+    split_priority: ["row_boundary", "section_boundary"] # Prefer row-level splits over arbitrary cuts
+  figure_captions:
+    attach_to_nearest_figure: true # Bind caption text to the closest figure/table graphic
+    max_caption_distance_lines: 3 # Caption can be up to N lines away from figure marker
+    fallback_prefixes: ["figure", "fig.", "chart", "table"] # Prefixes used to detect caption blocks
+    keep_caption_with_reference_text: true # Preserve references such as Figure 1 in same chunk
+  numbered_lists:
+    keep_parent_item_with_subitems: true # Keep parent bullets with immediate child items
+    preserve_numbering_tokens: true # Keep numbering markers (1., 1.1, a), i)) intact
+    renumber_on_split: false # Preserve original numbering from source document
+    split_on_top_level_item_only: true # Avoid splitting inside nested list branches
 
 extraction_config:
   strategy_c:
@@ -61,7 +77,7 @@ extraction_config:
     model: "google/gemini-flash-1.5"
     cost_per_1k_tokens: 0.000125
     cost_per_page: 0.01 # Used for per-document projected spend guardrail
-    vlm_max_spend_per_doc: 2.00 # HARD BUDGET CAP: USD (used by Strategy C)
+    vlm_max_spend_per_doc: 0.50 # HARD BUDGET CAP: USD (used by Strategy C)
     max_pages_to_process: 3 # Optional cap on pages sent to vision model
   strategy_a:
     min_font_threshold: 1

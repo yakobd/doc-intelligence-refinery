@@ -1,6 +1,12 @@
 from collections import defaultdict
+import os
 import re
-from typing import List
+from typing import Any, List
+
+try:
+    from langchain_groq import ChatGroq
+except ImportError:  # pragma: no cover - optional runtime dependency
+    ChatGroq = None
 
 from src.models.document_schema import LDU, PageIndexNode
 
@@ -15,47 +21,200 @@ class DocumentIndexer:
         r"\bIssue\s+No\b[^|,;\n]*",
         r"\bPage\s*\d+\b",
     )
+    SECTION_HEADER_PATTERN = re.compile(
+        r"^\s*(?:section\s+\d+(?:\.\d+)*|\d+(?:\.\d+)+)\b[:.)\-\s]*",
+        flags=re.IGNORECASE,
+    )
 
-    def build_index(self, ldus: list[LDU]) -> list[PageIndexNode]:
-        if not ldus:
-            return [
-                PageIndexNode(
-                    title="Page 1",
-                    summary="Page 1 is a placeholder page with no extracted sections. No additional content is available for summarization.",
-                    page_start=1,
-                    page_end=1,
-                    children=[],
-                )
-            ]
-
-        page_to_ldus: dict[int, list[LDU]] = defaultdict(list)
-        for ldu in ldus:
-            for page in ldu.page_refs:
-                page_to_ldus[int(page)].append(ldu)
-
-        index_nodes: list[PageIndexNode] = []
-        for page_number in sorted(page_to_ldus.keys()):
-            page_ldus = page_to_ldus[page_number]
-            page_headers = [
-                self._clean_title(self._ldu_title_text(ldu))
-                for ldu in page_ldus
-                if self._is_header_ldu(ldu)
-            ]
-            page_headers = [title for title in page_headers if title]
-            page_title = self._clean_title(" | ".join(page_headers)) if page_headers else f"Page {page_number}"
-
-            page_node = PageIndexNode(
-                title=page_title,
-                summary=self._generate_section_summary(page_title, page_ldus),
-                page_start=page_number,
-                page_end=page_number,
-                children=[],
+    def __init__(self) -> None:
+        self.llm = None
+        api_key = os.getenv("GROQ_API_KEY")
+        if api_key and ChatGroq is not None:
+            self.llm = ChatGroq(
+                model_name="llama-3.3-70b-versatile",
+                groq_api_key=api_key,
+                temperature=0,
+                max_tokens=300,
             )
 
-            self._attach_header_tree(page_node, page_ldus, page_number)
-            index_nodes.append(page_node)
+    def build_index(self, ldus: list[LDU]) -> list[PageIndexNode]:
+        json_nodes = self.build_index_tree_json(ldus)
+        return [self._json_node_to_page_index_node(node) for node in json_nodes]
 
-        return index_nodes
+    def build_index_tree_json(self, ldus: list[LDU]) -> list[dict[str, Any]]:
+        """
+        Return a hierarchical JSON tree for section indexing.
+
+        Each node includes: title, page_start, page_end, summary, contains_tables,
+        contains_figures, and children.
+        """
+        if not ldus:
+            return []
+
+        valid_ldus = [item for item in ldus if self._is_valid_ldu_like(item)]
+        ordered_ldus = sorted(
+            valid_ldus,
+            key=lambda item: (
+                self._first_page_or_default(item),
+                str(getattr(item, "uid", "")),
+            ),
+        )
+
+        if not ordered_ldus:
+            return []
+
+        root_nodes: list[dict[str, Any]] = []
+        stack: list[tuple[int, dict[str, Any]]] = []
+        page_roots: dict[int, dict[str, Any]] = {}
+
+        for ldu in ordered_ldus:
+            page = int(ldu.page_refs[0]) if ldu.page_refs else 1
+            title_candidate = self._clean_title(self._ldu_title_text(ldu))
+            is_header, level, normalized_title = self._parse_section_header(ldu, title_candidate)
+
+            if is_header:
+                node = {
+                    "title": normalized_title,
+                    "page_start": page,
+                    "page_end": page,
+                    "summary": "",
+                    "contains_tables": False,
+                    "contains_figures": False,
+                    "children": [],
+                    "_texts": [],
+                }
+
+                while stack and stack[-1][0] >= level:
+                    stack.pop()
+
+                if stack:
+                    stack[-1][1]["children"].append(node)
+                else:
+                    root_nodes.append(node)
+
+                stack.append((level, node))
+                continue
+
+            target = stack[-1][1] if stack else page_roots.get(page)
+            if target is None:
+                target = {
+                    "title": f"Page {page}",
+                    "page_start": page,
+                    "page_end": page,
+                    "summary": "",
+                    "contains_tables": False,
+                    "contains_figures": False,
+                    "children": [],
+                    "_texts": [],
+                }
+                page_roots[page] = target
+                root_nodes.append(target)
+
+            self._append_chunk_to_node(target, ldu, page)
+
+            for _, ancestor in stack:
+                ancestor["page_start"] = min(int(ancestor["page_start"]), page)
+                ancestor["page_end"] = max(int(ancestor["page_end"]), page)
+                self._update_node_flags(ancestor, ldu)
+
+        for node in root_nodes:
+            self._finalize_node(node)
+
+        return root_nodes
+
+    def _is_valid_ldu_like(self, item: Any) -> bool:
+        if item is None:
+            return False
+        if not hasattr(item, "page_refs"):
+            return False
+        if not hasattr(item, "uid"):
+            return False
+
+        page_refs = getattr(item, "page_refs", None)
+        return isinstance(page_refs, list)
+
+    def _first_page_or_default(self, item: Any, default: int = 1) -> int:
+        page_refs = getattr(item, "page_refs", None)
+        if isinstance(page_refs, list) and page_refs:
+            try:
+                return int(page_refs[0])
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    def _json_node_to_page_index_node(self, node: dict[str, Any]) -> PageIndexNode:
+        return PageIndexNode(
+            title=str(node.get("title", "Untitled Section")),
+            summary=str(node.get("summary", "")),
+            page_start=int(node.get("page_start", 1)),
+            page_end=int(node.get("page_end", 1)),
+            children=[self._json_node_to_page_index_node(child) for child in node.get("children", [])],
+        )
+
+    def _parse_section_header(self, ldu: LDU, title_candidate: str) -> tuple[bool, int, str]:
+        content = title_candidate or ""
+        unit_type = (ldu.unit_type or "").strip().lower()
+
+        # Explicitly match headers like "1.1 ..." and "Section 2 ...".
+        match = self.SECTION_HEADER_PATTERN.match(content)
+        if match:
+            token = match.group(0)
+            level = self._header_level_from_token(token)
+            return True, level, content
+
+        if unit_type in self.HEADER_TYPES and content:
+            return True, 1, content
+
+        return False, 0, content
+
+    def _header_level_from_token(self, token: str) -> int:
+        normalized = re.sub(r"[^\w\.]", "", (token or "").casefold())
+        number_match = re.search(r"(\d+(?:\.\d+)*)", normalized)
+        if not number_match:
+            return 1
+
+        number_path = number_match.group(1)
+        return max(1, len(number_path.split(".")))
+
+    def _append_chunk_to_node(self, node: dict[str, Any], ldu: LDU, page: int) -> None:
+        text = re.sub(r"\s+", " ", (ldu.content or "").strip())
+        if text:
+            node.setdefault("_texts", []).append(text)
+
+        node["page_start"] = min(int(node["page_start"]), page)
+        node["page_end"] = max(int(node["page_end"]), page)
+        self._update_node_flags(node, ldu)
+
+    def _update_node_flags(self, node: dict[str, Any], ldu: LDU) -> None:
+        chunk_type = (ldu.unit_type or "").casefold()
+        content = (ldu.content or "").casefold()
+
+        if chunk_type == "table" or "table" in content:
+            node["contains_tables"] = True
+        if chunk_type == "figure" or "figure" in content or "fig." in content:
+            node["contains_figures"] = True
+
+    def _finalize_node(self, node: dict[str, Any]) -> None:
+        for child in node.get("children", []):
+            self._finalize_node(child)
+            node["page_start"] = min(int(node["page_start"]), int(child.get("page_start", node["page_start"])))
+            node["page_end"] = max(int(node["page_end"]), int(child.get("page_end", node["page_end"])))
+            node["contains_tables"] = bool(node.get("contains_tables")) or bool(child.get("contains_tables"))
+            node["contains_figures"] = bool(node.get("contains_figures")) or bool(child.get("contains_figures"))
+
+        summary_texts = self._collect_node_texts(node)
+        node["summary"] = self._generate_section_summary(
+            str(node.get("title", "Untitled Section")),
+            summary_texts,
+        )
+
+        node.pop("_texts", None)
+
+    def _collect_node_texts(self, node: dict[str, Any]) -> list[str]:
+        texts = [str(item) for item in node.get("_texts", []) if str(item).strip()]
+        for child in node.get("children", []):
+            texts.extend(self._collect_node_texts(child))
+        return texts
 
     def _attach_header_tree(self, page_node: PageIndexNode, page_ldus: list[LDU], page_number: int) -> None:
         headers = [ldu for ldu in page_ldus if self._is_header_ldu(ldu)]
@@ -114,31 +273,35 @@ class DocumentIndexer:
             collected.extend(self._collect_subtree_ldus(child_header, headers_by_parent))
         return collected
 
-    def _generate_section_summary(self, title: str, child_ldus: List[LDU]) -> str:
+    def _generate_section_summary(self, title: str, section_texts: List[str]) -> str:
         section_title = self._clean_title(title) or "Untitled Section"
-        normalized_contents = [
-            re.sub(r"\s+", " ", (ldu.content or "").strip())
-            for ldu in child_ldus
-            if (ldu.content or "").strip()
-        ]
-        context_excerpt = " ".join(normalized_contents)[:1800]
+        normalized_contents = [re.sub(r"\s+", " ", text).strip() for text in section_texts if text.strip()]
+        context_excerpt = " ".join(normalized_contents)[:2200]
 
-        # Prompt template for a fast, low-cost model (e.g., Gemini Flash).
         prompt = (
             "You are a concise document summarizer. "
-            "Write a summary in exactly 2 sentences with factual language and no bullet points. "
+            "Write a summary in 2 to 3 sentences with factual language and no bullet points. "
             "Sentence 1 should state the section's main topic. "
-            "Sentence 2 should capture key supporting details or implications.\\n\\n"
+            "The remaining sentence(s) should capture key requirements, evidence, or implications.\\n\\n"
             f"Section title: {section_title}\\n"
             f"Section content: {context_excerpt or 'No extracted content provided.'}"
         )
-        _ = prompt
+
+        if self.llm is not None and context_excerpt:
+            try:
+                response = self.llm.invoke(prompt)
+                content = str(getattr(response, "content", "")).strip()
+                if content:
+                    return content
+            except Exception:
+                pass
 
         if context_excerpt:
             lead_text = context_excerpt[:220].rstrip(" .;,:-")
             return (
                 f"{section_title} centers on {lead_text}. "
-                "It highlights the most relevant details from this section to support downstream search and retrieval."
+                "It highlights the most relevant details from this section to support downstream search and retrieval. "
+                "This summary is generated from extracted evidence when an LLM response is unavailable."
             )
 
         return (
@@ -183,48 +346,24 @@ class DocumentIndexer:
         return heuristic_header
 
     def get_relevant_pages(self, query: str, nodes: list[PageIndexNode]) -> list[int]:
-        query_terms = {term for term in re.findall(r"\w+", (query or "").casefold()) if term}
-        if not query_terms:
-            return []
-
-        expanded_terms = self._expand_query_terms(query_terms)
-        min_score = 0.12
-        top_k = 8
-
-        scored_nodes: list[tuple[float, PageIndexNode]] = []
-        for node in self._iter_nodes(nodes):
-            title_text = self._clean_title(node.title).casefold()
-            if not title_text:
-                continue
-
-            title_terms = {term for term in re.findall(r"\w+", title_text) if term}
-            overlap = expanded_terms.intersection(title_terms)
-            score = len(overlap) / max(1, len(expanded_terms))
-
-            # Substring matching improves recall for partial term queries like "price" -> "price index".
-            if any(term in title_text for term in expanded_terms):
-                score = max(score, 0.35)
-
-            # Semantic fallback for price/index-change style queries.
-            if ({"price", "index", "changes"}.intersection(query_terms)) and (
-                {"inflation", "summary", "report"}.intersection(title_terms)
-            ):
-                score = max(score, 0.45)
-
-            # Domain-specific fallback for CPI mentions.
-            if ({"price", "inflation"}.intersection(query_terms)) and ("cpi" in title_terms):
-                score = max(score, 0.5)
-
-            if score >= min_score:
-                scored_nodes.append((score, node))
-
-        scored_nodes.sort(key=lambda item: item[0], reverse=True)
+        print(f"DEBUG: Finding pages for query: '{query}'")
+        query_terms = {term for term in re.findall(r'\w+', (query or "").casefold()) if term}
 
         matched_pages: set[int] = set()
-        for _, node in scored_nodes[:top_k]:
-            matched_pages.update(range(node.page_start, node.page_end + 1))
 
-        return sorted(matched_pages)
+        for node in self._iter_nodes(nodes):
+            title_text = node.title.casefold()
+            if any(term in title_text for term in query_terms):
+                matched_pages.update(range(node.page_start, node.page_end + 1))
+
+        # EMERGENCY FALLBACK: If no pages matched keywords, use all pages (1-5)
+        # to ensure the vector store is actually searched.
+        if not matched_pages:
+            print("DEBUG: No keyword match in index. Falling back to ALL pages.")
+            return list(range(1, 6))
+
+        print(f"DEBUG: Matched Pages: {sorted(list(matched_pages))}")
+        return sorted(list(matched_pages))
 
     def _expand_query_terms(self, query_terms: set[str]) -> set[str]:
         expanded = set(query_terms)

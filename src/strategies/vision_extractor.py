@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -60,24 +61,56 @@ class StrategyC(BaseStrategy):
         page_payloads: list[dict[str, Any]] = []
         warnings: list[str] = []
 
+        pre_flight_tokens = self._estimate_tokens(
+            profile=profile,
+            total_pages=int(getattr(profile, "pages", 0) or 0),
+        )
+        pre_flight_cost = (pre_flight_tokens / 1_000_000.0) * self.cost_per_million_tokens
+        if pre_flight_cost > self.max_budget:
+            warnings.append(
+                f"STRATEGY_C_ABORTED: Pre-flight cost estimate (${pre_flight_cost:.6f}) exceeds budget (${self.max_budget:.6f})"
+            )
+            return self._partial_output(
+                filename=filename,
+                doc_id=doc_id,
+                profile=profile,
+                warnings=warnings,
+                projected_cost=pre_flight_cost,
+                estimated_tokens=pre_flight_tokens,
+            )
+
         try:
             with pdfplumber.open(pdf_path) as pdf:
-                total_pages = len(pdf.pages)
-                page_payloads = self._build_page_payloads(pdf_path=pdf_path, pdf=pdf, warnings=warnings)
+                page_payloads, estimated_tokens, projected_cost = self._build_page_payloads(
+                    pdf_path=pdf_path,
+                    pdf=pdf,
+                    warnings=warnings,
+                )
         except Exception as open_error:
             logger.exception("StrategyC failed to open PDF, returning partial output: %s", open_error)
             return self._partial_output(filename=filename, doc_id=doc_id, profile=profile, warnings=[str(open_error)])
 
-        estimated_tokens = self._estimate_tokens(profile=profile, total_pages=total_pages)
-        projected_cost = (estimated_tokens / 1_000_000.0) * self.cost_per_million_tokens
-        if projected_cost > self.max_budget:
-            raise ValueError(
-                f"Budget exceeded for {filename}: projected ${projected_cost:.2f} > max ${self.max_budget:.2f}"
+        if not page_payloads:
+            if not warnings:
+                warnings.append("Budget exceeded, partial results returned.")
+            return self._partial_output(
+                filename=filename,
+                doc_id=doc_id,
+                profile=profile,
+                warnings=warnings,
+                projected_cost=projected_cost,
+                estimated_tokens=estimated_tokens,
             )
 
         try:
             response_payload = self._call_openrouter(page_payloads=page_payloads)
-            ldus, provenance_items, index_nodes = self._map_response_to_ldus(response_payload, doc_id, filename, profile)
+            ldus, provenance_items, index_nodes = self._map_response_to_ldus(
+                response_payload=response_payload,
+                doc_id=doc_id,
+                filename=filename,
+                profile=profile,
+                page_payloads=page_payloads,
+            )
         except Exception as api_error:
             logger.exception("StrategyC API call failed, returning partial output: %s", api_error)
             warnings.append(str(api_error))
@@ -109,9 +142,15 @@ class StrategyC(BaseStrategy):
             metadata=metadata,
         )
 
-    def _build_page_payloads(self, pdf_path: str, pdf: pdfplumber.PDF, warnings: list[str]) -> list[dict[str, Any]]:
+    def _build_page_payloads(
+        self,
+        pdf_path: str,
+        pdf: pdfplumber.PDF,
+        warnings: list[str],
+    ) -> tuple[list[dict[str, Any]], int, float]:
         page_payloads: list[dict[str, Any]] = []
         pages_to_process = min(self.max_pages_to_process, len(pdf.pages))
+        running_tokens = 0
 
         for page_number in range(1, pages_to_process + 1):
             try:
@@ -119,24 +158,46 @@ class StrategyC(BaseStrategy):
                 text = page.extract_text() or ""
                 image_count = len(page.images or [])
                 high_confidence_text = len(text) > 500 and image_count == 0
+                include_image = not high_confidence_text
+
+                page_token_estimate = self._estimate_page_tokens(text=text, include_image=include_image)
+                candidate_total_tokens = running_tokens + page_token_estimate
+                candidate_projected_cost = (candidate_total_tokens / 1_000_000.0) * self.cost_per_million_tokens
+
+                if candidate_projected_cost > self.max_budget:
+                    warnings.append("Budget exceeded, partial results returned.")
+                    break
+
+                page_width = float(getattr(page, "width", 0.0) or 0.0)
+                page_height = float(getattr(page, "height", 0.0) or 0.0)
 
                 payload: dict[str, Any] = {
                     "page_number": page_number,
                     "text": text,
+                    "page_width": page_width,
+                    "page_height": page_height,
                 }
 
-                if not high_confidence_text:
+                if include_image:
                     image_b64 = self._page_image_base64(pdf_path=pdf_path, page_number=page_number)
                     if image_b64:
                         payload["image_base64"] = image_b64
 
                 page_payloads.append(payload)
+                running_tokens = candidate_total_tokens
             except Exception as page_error:
                 message = f"StrategyC skipped page {page_number} due to error: {page_error}"
                 logger.exception(message)
                 warnings.append(message)
 
-        return page_payloads
+        projected_cost = (running_tokens / 1_000_000.0) * self.cost_per_million_tokens
+        return page_payloads, running_tokens, projected_cost
+
+    def _estimate_page_tokens(self, text: str, include_image: bool) -> int:
+        text_tokens = int(math.ceil(len(text or "") / 4.0))
+        image_tokens = 700 if include_image else 0
+        # Small fixed overhead for instruction and schema context.
+        return text_tokens + image_tokens + 150
 
     def _page_image_base64(self, pdf_path: str, page_number: int) -> str | None:
         convert_from_path = self._load_pdf2image_converter()
@@ -180,14 +241,33 @@ class StrategyC(BaseStrategy):
 
         model_name = os.getenv("OPENROUTER_MODEL", self.default_model)
         instruction = (
-            "Extract the main text and any tables into a structured JSON format. "
-            "Return strict JSON with this schema: "
-            "{'pages':[{'page_number':int,'text':str,'tables':[{'title':str|null,'headers':[str],'rows':[[str]]}]}]}"
+            "You are a multimodal document analyst. Analyze each page's text and optional image. "
+            "Identify section titles/headers versus normal paragraphs to support hierarchical indexing. "
+            "Extract tables as both structured rows and markdown. "
+            "Return STRICT JSON only using this schema: "
+            "{\"pages\":[{"
+            "\"page_number\":int,"
+            "\"page_width\":number,"
+            "\"page_height\":number,"
+            "\"blocks\":[{\"kind\":\"title|header|paragraph\",\"text\":str}],"
+            "\"text\":str,"
+            "\"tables\":[{\"title\":str|null,\"headers\":[str],\"rows\":[[str]]}],"
+            "\"markdown_tables\":[str]"
+            "}]}"
         )
 
         content_items: list[dict[str, Any]] = [{"type": "text", "text": instruction}]
         for payload in page_payloads:
-            content_items.append({"type": "text", "text": f"Page {payload['page_number']} text:\n{payload.get('text', '')}"})
+            content_items.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Page {payload['page_number']} "
+                        f"(width={payload.get('page_width', 0)}, height={payload.get('page_height', 0)}) text:\n"
+                        f"{payload.get('text', '')}"
+                    ),
+                }
+            )
             image_base64 = payload.get("image_base64")
             if image_base64:
                 content_items.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}})
@@ -204,13 +284,24 @@ class StrategyC(BaseStrategy):
             "X-Title": "doc-intelligence-refinery",
         }
 
-        with httpx_module.Client(timeout=120.0) as client:
+        with httpx_module.Client(timeout=120.0, verify=False) as client:
             response = client.post(self.OPENROUTER_URL, headers=headers, json=request_body)
+            print(f"DEBUG: LLM Raw Response: {response.text}")
             response.raise_for_status()
             payload = response.json()
 
         message_content = self._extract_message_content(payload)
-        return self._coerce_json_payload(message_content)
+        parsed = self._coerce_json_payload(message_content)
+        if parsed.get("pages"):
+            return parsed
+
+        repaired_content = self._repair_json_with_retry(
+            raw_text=message_content,
+            model_name=model_name,
+            headers=headers,
+            httpx_module=httpx_module,
+        )
+        return self._coerce_json_payload(repaired_content)
 
     def _extract_message_content(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices", [])
@@ -219,11 +310,53 @@ class StrategyC(BaseStrategy):
         return choices[0].get("message", {}).get("content", "")
 
     def _coerce_json_payload(self, raw_text: str) -> dict[str, Any]:
+        import re as _re
+
+        clean_text = (raw_text or "").replace("```json", "").replace("```", "").strip()
+
+        parse_candidates = [clean_text]
+        brace_match = _re.search(r"\{[\s\S]*\}", clean_text)
+        if brace_match:
+            parse_candidates.append(brace_match.group(0).strip())
+
+        for candidate in parse_candidates:
+            if not candidate:
+                continue
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+
+        return {"pages": []}
+
+    def _repair_json_with_retry(
+        self,
+        raw_text: str,
+        model_name: str,
+        headers: dict[str, str],
+        httpx_module: Any,
+    ) -> str:
+        repair_prompt = (
+            "Repair the following malformed output into strict valid JSON only. "
+            "Do not add commentary. Keep the same schema and preserve content where possible.\n\n"
+            f"MALFORMED_OUTPUT:\n{raw_text}"
+        )
+
         try:
-            clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean_text)
+            request_body = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": repair_prompt}]}],
+                "temperature": 0,
+            }
+            with httpx_module.Client(timeout=60.0) as client:
+                response = client.post(self.OPENROUTER_URL, headers=headers, json=request_body)
+                response.raise_for_status()
+                payload = response.json()
+            return self._extract_message_content(payload)
         except Exception:
-            return {"pages": []}
+            return raw_text
 
     def _load_httpx(self) -> Any:
         try:
@@ -244,11 +377,20 @@ class StrategyC(BaseStrategy):
         doc_id: str,
         filename: str,
         profile: DocumentProfile,
+        page_payloads: list[dict[str, Any]],
     ) -> tuple[list[LDU], list[dict[str, Any]], list[PageIndexNode]]:
         pages_data = response_payload.get("pages", [])
         ldus: list[LDU] = []
         provenance_items: list[dict[str, Any]] = []
         index_nodes: list[PageIndexNode] = []
+        page_dims = {
+            int(payload.get("page_number", 0)): (
+                float(payload.get("page_width", 0.0) or 0.0),
+                float(payload.get("page_height", 0.0) or 0.0),
+            )
+            for payload in page_payloads
+            if isinstance(payload, dict) and payload.get("page_number")
+        }
 
         if not isinstance(pages_data, list):
             pages_data = []
@@ -258,8 +400,59 @@ class StrategyC(BaseStrategy):
                 continue
 
             page_number = int(page_item.get("page_number", len(index_nodes) + 1))
+            item_width = float(page_item.get("page_width", 0.0) or 0.0)
+            item_height = float(page_item.get("page_height", 0.0) or 0.0)
+            known_width, known_height = page_dims.get(page_number, (0.0, 0.0))
+            page_width = item_width if item_width > 0 else known_width
+            page_height = item_height if item_height > 0 else known_height
             page_text = str(page_item.get("text", "")).strip()
-            page_bbox = BBox(x_min=0.0, y_min=0.0, x_max=0.0, y_max=0.0, page_number=page_number)
+            page_bbox = BBox(
+                x_min=0.0,
+                y_min=0.0,
+                x_max=page_width,
+                y_max=page_height,
+                page_number=page_number,
+            )
+
+            blocks = page_item.get("blocks", [])
+            if isinstance(blocks, list):
+                for block_idx, block in enumerate(blocks, start=1):
+                    if not isinstance(block, dict):
+                        continue
+
+                    kind = str(block.get("kind", "paragraph")).strip().casefold()
+                    text = str(block.get("text", "")).strip()
+                    if not text:
+                        continue
+
+                    mapped_kind = "paragraph"
+                    if kind == "title":
+                        mapped_kind = "title"
+                    elif kind in {"header", "section_header", "heading"}:
+                        mapped_kind = "header"
+
+                    block_hash = self._hash_content(f"{mapped_kind}:{text}")
+                    block_uid = f"{doc_id}-p{page_number:03d}-blk{block_idx:03d}"
+                    ldus.append(
+                        LDU(
+                            uid=block_uid,
+                            unit_type=mapped_kind,
+                            content=text,
+                            content_hash=block_hash,
+                            page_refs=[page_number],
+                            bounding_box=page_bbox,
+                            parent_section=f"page-{page_number}",
+                            child_chunks=self.chunk_text(text),
+                        )
+                    )
+                    provenance_items.append(
+                        ProvenanceChain(
+                            source_file=filename,
+                            content_hash=block_hash,
+                            bbox=page_bbox,
+                            strategy_used=profile.selected_strategy.value,
+                        ).model_dump()
+                    )
 
             if page_text:
                 text_hash = self._hash_content(page_text)
@@ -284,6 +477,36 @@ class StrategyC(BaseStrategy):
                         strategy_used=profile.selected_strategy.value,
                     ).model_dump()
                 )
+
+            markdown_tables = page_item.get("markdown_tables", [])
+            if isinstance(markdown_tables, list):
+                for md_idx, markdown_table in enumerate(markdown_tables, start=1):
+                    md_text = str(markdown_table or "").strip()
+                    if not md_text:
+                        continue
+
+                    md_hash = self._hash_content(md_text)
+                    md_uid = f"{doc_id}-p{page_number:03d}-mdtbl{md_idx:02d}"
+                    ldus.append(
+                        LDU(
+                            uid=md_uid,
+                            unit_type="table",
+                            content=md_text,
+                            content_hash=md_hash,
+                            page_refs=[page_number],
+                            bounding_box=page_bbox,
+                            parent_section=f"page-{page_number}",
+                            child_chunks=self.chunk_text(md_text),
+                        )
+                    )
+                    provenance_items.append(
+                        ProvenanceChain(
+                            source_file=filename,
+                            content_hash=md_hash,
+                            bbox=page_bbox,
+                            strategy_used=profile.selected_strategy.value,
+                        ).model_dump()
+                    )
 
             for table_idx, table_item in enumerate(page_item.get("tables", []), start=1):
                 if not isinstance(table_item, dict):

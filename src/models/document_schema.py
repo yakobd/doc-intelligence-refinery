@@ -1,7 +1,6 @@
 import hashlib
 from enum import Enum
 from typing import List, Optional, Dict, Union, Any
-from datetime import datetime
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
 # 1. Type Precision: Dedicated BBox Model (Rubric Item #2)
@@ -32,11 +31,65 @@ class StrategyTier(str, Enum):
 # 3. Provenance Citation Chains (Rubric Item #3)
 class ProvenanceChain(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source_file: str
-    content_hash: str  # Required for Mastery
-    bbox: BBox         # Required: Structured sub-model
-    strategy_used: str
-    extraction_timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    document_name: str
+    page_number: int
+    bbox: List[float]
+    content_hash: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+
+        # Backward compatibility: accept legacy naming used across extractors.
+        if "document_name" not in normalized and "source_file" in normalized:
+            normalized["document_name"] = normalized.pop("source_file")
+
+        # Derive page_number from bbox.page_number when missing.
+        raw_bbox = normalized.get("bbox")
+        if "page_number" not in normalized:
+            if isinstance(raw_bbox, BBox):
+                normalized["page_number"] = int(raw_bbox.page_number)
+            elif isinstance(raw_bbox, dict) and "page_number" in raw_bbox:
+                normalized["page_number"] = int(raw_bbox["page_number"])
+            else:
+                normalized["page_number"] = 1
+
+        # Normalize bbox to [x_min, y_min, x_max, y_max].
+        if isinstance(raw_bbox, BBox):
+            normalized["bbox"] = [raw_bbox.x_min, raw_bbox.y_min, raw_bbox.x_max, raw_bbox.y_max]
+        elif isinstance(raw_bbox, dict):
+            if {"x_min", "y_min", "x_max", "y_max"}.issubset(raw_bbox.keys()):
+                normalized["bbox"] = [
+                    raw_bbox["x_min"],
+                    raw_bbox["y_min"],
+                    raw_bbox["x_max"],
+                    raw_bbox["y_max"],
+                ]
+
+        # Ignore legacy-only fields if present.
+        normalized.pop("strategy_used", None)
+        normalized.pop("extraction_timestamp", None)
+
+        return normalized
+
+    @field_validator("bbox")
+    @classmethod
+    def validate_bbox(cls, v: List[float]) -> List[float]:
+        if len(v) != 4:
+            raise ValueError("bbox must contain exactly 4 float values")
+        return v
+
+
+class ExtractedFact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fact_name: str
+    value: float | str
+    unit: str
+    provenance: ProvenanceChain
 
 # 4. Chunk Model
 class Chunk(BaseModel):

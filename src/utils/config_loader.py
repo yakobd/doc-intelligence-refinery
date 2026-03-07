@@ -4,8 +4,25 @@ from typing import Any
 
 import yaml
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency guard
+    load_dotenv = None
 
-DEFAULT_CONFIG_PATH = "rubric/extraction_rules.yaml"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "rubric" / "extraction_rules.yaml"
+DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+
+if load_dotenv is not None:
+    load_dotenv(dotenv_path=DEFAULT_ENV_PATH)
+
+
+def _resolve_config_path(config_path: str | Path) -> Path:
+    path = Path(config_path).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
 
 
 def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -84,9 +101,9 @@ def default_config() -> dict[str, Any]:
 
 
 @lru_cache(maxsize=8)
-def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+def load_config(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     config = default_config()
-    path = Path(config_path)
+    path = _resolve_config_path(config_path)
 
     if not path.exists():
         return config

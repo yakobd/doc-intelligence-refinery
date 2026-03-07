@@ -1,0 +1,1 @@
+{"timestamp": "2026-03-07T22:23:32.336088+00:00", "filename": "Security_Vulnerability_Disclosure_Standard_Procedure_2.pdf", "strategy_used": "VISION", "confidence_score": 0.6, "final_cost": 0.0, "cost_estimate": 0.0, "cost_status": "WITHIN_BUDGET", "processing_time": 0.0, "status": "SUCCESS", "warning": "LLM initialization failed; used PyMuPDF fallback extraction."}

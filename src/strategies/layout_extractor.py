@@ -116,6 +116,12 @@ class StrategyB(BaseStrategy):
         elements: list[dict[str, Any]] = []
         ordinal = 0
 
+        header_elements = self._collect_docling_heading_elements(document=document)
+        for header in header_elements:
+            ordinal += 1
+            header["ordinal"] = ordinal
+            elements.append(header)
+
         markdown = document.export_to_markdown() if hasattr(document, "export_to_markdown") else ""
         if markdown.strip():
             ordinal += 1
@@ -168,6 +174,83 @@ class StrategyB(BaseStrategy):
 
         elements.sort(key=lambda item: (item["bbox"].page_number, item["top"], item["left"], item["ordinal"]))
         return elements
+
+    def _collect_docling_heading_elements(self, document: Any) -> list[dict[str, Any]]:
+        """Extract explicit heading/title nodes from Docling output for hierarchical indexing."""
+        elements: list[dict[str, Any]] = []
+
+        for container_name in ("texts", "paragraphs", "items", "elements", "blocks"):
+            container = getattr(document, container_name, None)
+            if not container:
+                continue
+
+            for item in container:
+                kind_hint = self._docling_kind_hint(item)
+                if kind_hint not in {"section_header", "title", "heading", "header"}:
+                    continue
+
+                content = self._docling_item_text(item)
+                if not content:
+                    continue
+
+                bbox = self._bbox_from_docling_item(item)
+                mapped_kind = "title" if kind_hint == "title" else "header"
+                elements.append(
+                    {
+                        "kind": mapped_kind,
+                        "content": content,
+                        "bbox": bbox,
+                        "top": bbox.y_min,
+                        "left": bbox.x_min,
+                        "ordinal": 0,
+                    }
+                )
+
+        return elements
+
+    def _docling_kind_hint(self, item: Any) -> str:
+        candidates: list[str] = []
+        for attr in ("kind", "type", "label", "category", "role"):
+            value = getattr(item, attr, None)
+            if value is not None:
+                candidates.append(str(value))
+
+        if isinstance(item, dict):
+            for key in ("kind", "type", "label", "category", "role"):
+                value = item.get(key)
+                if value is not None:
+                    candidates.append(str(value))
+
+        normalized = " ".join(candidates).casefold()
+        if "section_header" in normalized:
+            return "section_header"
+        if "title" in normalized:
+            return "title"
+        if "heading" in normalized:
+            return "heading"
+        if "header" in normalized:
+            return "header"
+        return ""
+
+    def _docling_item_text(self, item: Any) -> str:
+        for attr in ("text", "content", "value", "caption", "label"):
+            value = getattr(item, attr, None)
+            if value and str(value).strip():
+                return str(value).strip()
+
+        export_to_text = getattr(item, "export_to_text", None)
+        if callable(export_to_text):
+            value = export_to_text()
+            if value and str(value).strip():
+                return str(value).strip()
+
+        if isinstance(item, dict):
+            for key in ("text", "content", "value", "caption", "label"):
+                value = item.get(key)
+                if value and str(value).strip():
+                    return str(value).strip()
+
+        return ""
 
     def _bbox_from_docling_item(self, item: Any) -> BBox:
         for attr_name in ("bbox", "prov", "provenance"):
