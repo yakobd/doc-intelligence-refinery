@@ -14,6 +14,7 @@ from src.models.document_schema import (
     ProvenanceChain,
 )
 from src.strategies.base_strategy import BaseStrategy
+from src.utils.config_loader import get_extraction_config
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +23,16 @@ class StrategyA(BaseStrategy):
     """Fast text-first strategy for native digital and simple-layout PDFs."""
 
     STANDARD_FONTS = {"times", "arial", "helvetica", "courier", "calibri", "georgia", "verdana"}
+    DEFAULT_SCANNED_IMAGE_THRESHOLD = 0.35
+    LOW_CONFIDENCE_ON_SCAN = 0.2
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config=config)
+        extraction_config = get_extraction_config(self.config)
+        strategy_config = extraction_config.get("strategy_a", {}) if isinstance(extraction_config, dict) else {}
+        self.scanned_image_threshold = float(
+            strategy_config.get("scanned_image_threshold", self.DEFAULT_SCANNED_IMAGE_THRESHOLD)
+        )
 
     def extract(self, pdf_path: str, profile: DocumentProfile) -> NormalizedOutput:
         filename = Path(pdf_path).name
@@ -164,9 +172,13 @@ class StrategyA(BaseStrategy):
         page_width: float,
         page_height: float,
     ) -> float:
+        image_density = self._image_density_ratio(images=images, page_width=page_width, page_height=page_height)
+        if image_density > self.scanned_image_threshold:
+            return self.LOW_CONFIDENCE_ON_SCAN
+
         font_score = self._font_presence_score(chars)
         density_score = self._character_density_score(text=text, page_width=page_width, page_height=page_height)
-        image_ratio_score = self._image_to_text_ratio_score(chars=chars, images=images)
+        image_ratio_score = self._image_density_score(image_density)
 
         weighted = (0.35 * font_score) + (0.35 * density_score) + (0.30 * image_ratio_score)
         return max(0.0, min(1.0, round(weighted, 4)))
@@ -195,28 +207,21 @@ class StrategyA(BaseStrategy):
             return 1.0
         return 0.75
 
-    def _image_to_text_ratio_score(self, chars: list[dict[str, Any]], images: list[dict[str, Any]]) -> float:
-        image_area = 0.0
+    def _image_density_ratio(self, images: list[dict[str, Any]], page_width: float, page_height: float) -> float:
+        total_page_area = max(1.0, page_width * page_height)
+        total_image_area = 0.0
+
         for image in images:
             width = float(image.get("width", 0.0) or 0.0)
             height = float(image.get("height", 0.0) or 0.0)
-            image_area += max(0.0, width * height)
+            total_image_area += max(0.0, width * height)
 
-        text_area = 0.0
-        for char in chars:
-            x0 = float(char.get("x0", 0.0) or 0.0)
-            x1 = float(char.get("x1", 0.0) or 0.0)
-            top = float(char.get("top", 0.0) or 0.0)
-            bottom = float(char.get("bottom", top) or top)
-            text_area += max(0.0, x1 - x0) * max(0.0, bottom - top)
+        return total_image_area / total_page_area
 
-        if text_area <= 0 and image_area > 0:
-            return 0.1
-
-        ratio = image_area / max(1e-6, text_area)
-        if ratio > 3.0:
+    def _image_density_score(self, image_density: float) -> float:
+        if image_density > 0.6:
             return 0.2
-        if ratio > 1.0:
+        if image_density > 0.3:
             return 0.5
         return 1.0
 

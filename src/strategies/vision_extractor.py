@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 class StrategyC(BaseStrategy):
     """Vision-assisted extraction strategy for scanned or difficult PDFs."""
 
-    DEFAULT_COST_PER_PAGE = 0.01
+    DEFAULT_COST_PER_1K_TOKENS = 0.000125
     DEFAULT_MODEL = "google/gemini-flash-1.5"
     OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -42,7 +43,13 @@ class StrategyC(BaseStrategy):
                 strategy_config.get("max_budget_per_doc", 0.5),
             )
         )
-        self.cost_per_page = float(strategy_config.get("cost_per_page", self.DEFAULT_COST_PER_PAGE))
+        configured_cost_per_million = strategy_config.get("cost_per_million_tokens")
+        if isinstance(configured_cost_per_million, (int, float)):
+            self.cost_per_million_tokens = float(configured_cost_per_million)
+        else:
+            cost_per_1k = strategy_config.get("cost_per_1k_tokens", self.DEFAULT_COST_PER_1K_TOKENS)
+            self.cost_per_million_tokens = float(cost_per_1k) * 1000.0
+
         self.max_pages_to_process = int(strategy_config.get("max_pages_to_process", 3))
         self.default_model = str(strategy_config.get("model", self.DEFAULT_MODEL))
         self.api_key_env = str(strategy_config.get("api_key_env", "OPENROUTER_API_KEY"))
@@ -61,7 +68,8 @@ class StrategyC(BaseStrategy):
             logger.exception("StrategyC failed to open PDF, returning partial output: %s", open_error)
             return self._partial_output(filename=filename, doc_id=doc_id, profile=profile, warnings=[str(open_error)])
 
-        projected_cost = total_pages * self.cost_per_page
+        estimated_tokens = self._estimate_tokens(profile=profile, total_pages=total_pages)
+        projected_cost = (estimated_tokens / 1_000_000.0) * self.cost_per_million_tokens
         if projected_cost > self.max_budget:
             raise ValueError(
                 f"Budget exceeded for {filename}: projected ${projected_cost:.2f} > max ${self.max_budget:.2f}"
@@ -73,12 +81,21 @@ class StrategyC(BaseStrategy):
         except Exception as api_error:
             logger.exception("StrategyC API call failed, returning partial output: %s", api_error)
             warnings.append(str(api_error))
-            return self._partial_output(filename=filename, doc_id=doc_id, profile=profile, warnings=warnings)
+            return self._partial_output(
+                filename=filename,
+                doc_id=doc_id,
+                profile=profile,
+                warnings=warnings,
+                projected_cost=projected_cost,
+                estimated_tokens=estimated_tokens,
+            )
 
         metadata: dict[str, Any] = {
             "selected_strategy": profile.selected_strategy.value,
             "avg_confidence": float(self.config.get("router_config", {}).get("default_fallback_confidence", 0.85)),
             "provenance_chain": provenance_items,
+            "estimated_tokens": estimated_tokens,
+            "projected_cost": round(projected_cost, 6),
         }
         if warnings:
             metadata["warning"] = " | ".join(warnings)
@@ -141,6 +158,16 @@ class StrategyC(BaseStrategy):
             return base64.b64encode(buffer.getvalue()).decode("utf-8")
         except Exception:
             return None
+
+    def _estimate_tokens(self, profile: DocumentProfile, total_pages: int) -> int:
+        safe_pages = max(1, int(total_pages))
+        estimated_chars_raw = getattr(profile, "estimated_chars", 0)
+
+        if isinstance(estimated_chars_raw, (int, float)) and float(estimated_chars_raw) > 0:
+            text_tokens = int(math.ceil(float(estimated_chars_raw) / 4.0))
+            return text_tokens + (safe_pages * 500)
+
+        return safe_pages * 1500
 
     def _call_openrouter(self, page_payloads: list[dict[str, Any]]) -> dict[str, Any]:
         httpx_module = self._load_httpx()
@@ -320,13 +347,26 @@ class StrategyC(BaseStrategy):
     def _hash_content(self, content: str) -> str:
         return hashlib.md5(content.encode("utf-8")).hexdigest()
 
-    def _partial_output(self, filename: str, doc_id: str, profile: DocumentProfile, warnings: list[str]) -> NormalizedOutput:
+    def _partial_output(
+        self,
+        filename: str,
+        doc_id: str,
+        profile: DocumentProfile,
+        warnings: list[str],
+        projected_cost: float | None = None,
+        estimated_tokens: int | None = None,
+    ) -> NormalizedOutput:
         metadata: dict[str, Any] = {
             "selected_strategy": profile.selected_strategy.value,
             "avg_confidence": 0.0,
             "provenance_chain": [],
             "warning": " | ".join(warnings) if warnings else "StrategyC returned partial output",
         }
+        if isinstance(projected_cost, (int, float)):
+            metadata["projected_cost"] = round(float(projected_cost), 6)
+        if isinstance(estimated_tokens, int):
+            metadata["estimated_tokens"] = estimated_tokens
+
         return NormalizedOutput(
             filename=filename,
             doc_id=doc_id,

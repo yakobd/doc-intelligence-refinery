@@ -62,6 +62,7 @@ def default_config() -> dict[str, Any]:
         "extraction_config": {
             "strategy_a": {
                 "min_font_threshold": 1,
+                "scanned_image_threshold": 0.35,
             },
             "strategy_c": {
                 "api_key_env": "OPENROUTER_API_KEY",

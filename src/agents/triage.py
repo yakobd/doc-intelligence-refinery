@@ -38,6 +38,8 @@ class TriageAgent:
             )
         )
         self.high_font_density_char_count = int(self.thresholds.get("high_font_density_char_count", 200))
+        self.scanned_char_density_per_area = float(self.thresholds.get("scanned_char_density_per_area", 0.0002))
+        self.table_to_text_ratio_threshold = float(self.thresholds.get("table_to_text_ratio_threshold", 0.2))
         self.domain_classifier = domain_classifier or KeywordDomainClassifier(self.domain_keywords)
 
 
@@ -49,10 +51,15 @@ class TriageAgent:
 
         origin_type = self._detect_origin(signals)
         layout_complexity = self._detect_layout_complexity(signals)
-        domain_hint, domain_confidence = self.domain_classifier.classify(signals["combined_text"])
+        domain_hint, domain_confidence = self._classify_domain(signals["combined_text"])
         selected_strategy = self._select_strategy(origin_type, layout_complexity)
         confidence_score = self._calculate_confidence(signals, origin_type)
-        estimated_cost = self._estimate_cost(selected_strategy, signals["total_pages"])
+        estimated_chars = int(signals.get("estimated_chars", 0))
+        estimated_cost = self._estimate_cost(
+            selected_strategy=selected_strategy,
+            estimated_chars=estimated_chars,
+            pages=signals["total_pages"],
+        )
 
         return DocumentProfile(
             filename=filename,
@@ -61,6 +68,7 @@ class TriageAgent:
             selected_strategy=selected_strategy,
             confidence_score=confidence_score,
             estimated_cost=estimated_cost,
+            estimated_chars=estimated_chars,
             pages=signals["total_pages"],
             language="en",
             domain_hint=domain_hint,
@@ -88,8 +96,11 @@ class TriageAgent:
                 "has_fonts_any": False,
                 "low_density_ratio": 1.0,
                 "avg_chars_per_page": 0.0,
+                "estimated_chars": 0,
+                "avg_char_density": 0.0,
                 "avg_bbox_density": 0.0,
                 "table_page_ratio": 0.0,
+                "table_to_text_ratio": 0.0,
                 "gutter_found": False,
                 "combined_text": "",
                 "has_acroform": self._has_acroform(pdf),
@@ -105,7 +116,9 @@ class TriageAgent:
         text_rich_pages = 0
 
         total_chars = 0
+        total_char_density = 0.0
         total_bbox_density = 0.0
+        total_table_chars = 0
         gutter_found = False
         zero_font_pages: list[int] = []
         high_font_density_pages: list[int] = []
@@ -131,13 +144,22 @@ class TriageAgent:
                 if char_count <= float(self.thresholds["scanned_image_char_density"]):
                     low_density_pages += 1
 
-                if bool(page.find_tables()):
+                detected_tables = page.find_tables()
+                if bool(detected_tables):
                     table_pages += 1
+
+                for detected_table in detected_tables:
+                    raw_rows = detected_table.extract() or []
+                    for row in raw_rows:
+                        for cell in row:
+                            if cell:
+                                total_table_chars += len(str(cell).strip())
 
                 if char_count >= float(self.thresholds["single_column_min_chars_per_page"]):
                     text_rich_pages += 1
 
                 page_area = max(1.0, float(page.width) * float(page.height))
+                total_char_density += char_count / page_area
                 char_bbox_area = 0.0
                 for char in chars:
                     x0 = float(char.get("x0", 0.0) or 0.0)
@@ -164,8 +186,11 @@ class TriageAgent:
             "has_fonts_any": fonts_detected_pages > 0,
             "low_density_ratio": low_density_pages / total_pages,
             "avg_chars_per_page": total_chars / total_pages,
+            "estimated_chars": total_chars,
+            "avg_char_density": total_char_density / total_pages,
             "avg_bbox_density": total_bbox_density / total_pages,
             "table_page_ratio": table_pages / total_pages,
+            "table_to_text_ratio": (total_table_chars / max(1, total_chars)),
             "gutter_found": gutter_found,
             "combined_text": "\n".join(combined_text_parts),
             "has_acroform": self._has_acroform(pdf),
@@ -200,6 +225,8 @@ class TriageAgent:
     def _detect_origin(self, signals: dict[str, Any]) -> OriginType:
         zero_font_pages = signals.get("zero_font_pages", [])
         high_font_density_pages = signals.get("high_font_density_pages", [])
+        avg_char_density = float(signals.get("avg_char_density", 0.0))
+        scan_like_density = avg_char_density <= self.scanned_char_density_per_area
 
         if zero_font_pages and high_font_density_pages:
             logger.info(
@@ -209,9 +236,14 @@ class TriageAgent:
             )
             return OriginType.MIXED
 
-        if not signals["has_fonts_any"]:
+        if scan_like_density:
+            if signals["has_fonts_any"] and signals["low_density_ratio"] >= self.mixed_mode_ratio:
+                return OriginType.MIXED
             if signals["has_acroform"]:
                 return OriginType.MIXED
+            return OriginType.SCANNED_IMAGE
+
+        if not signals["has_fonts_any"]:
             return OriginType.SCANNED_IMAGE
 
         if signals["low_density_ratio"] >= self.mixed_mode_ratio:
@@ -220,7 +252,10 @@ class TriageAgent:
         return OriginType.NATIVE_DIGITAL
 
     def _detect_layout_complexity(self, signals: dict[str, Any]) -> LayoutComplexity:
-        if signals["table_page_ratio"] >= float(self.thresholds["table_heavy_density"]):
+        if (
+            signals["table_page_ratio"] >= float(self.thresholds["table_heavy_density"])
+            or float(signals.get("table_to_text_ratio", 0.0)) >= self.table_to_text_ratio_threshold
+        ):
             return LayoutComplexity.TABLE_HEAVY
 
         if (
@@ -288,12 +323,15 @@ class TriageAgent:
         empty_ratio = empty_slices / slice_count
         return empty_ratio >= float(self.thresholds["multi_column_empty_slice_ratio"])
 
-    def _classify_domain(self, text: str) -> str:
+    def _classify_domain(self, text: str) -> tuple[str, float]:
         """Pluggable domain classifier entry point.
 
         Replace this single method to swap keyword-based classification with VLM/ML.
         """
-        return self.domain_classifier.classify(text)
+        domain_hint, domain_confidence = self.domain_classifier.classify(text)
+        domain = str(domain_hint).strip().lower() or "general"
+        confidence = float(domain_confidence) if isinstance(domain_confidence, (int, float)) else 0.0
+        return domain, max(0.0, min(1.0, round(confidence, 4)))
 
     def _select_strategy(self, origin_type: OriginType, layout_complexity: LayoutComplexity) -> StrategyTier:
         if origin_type in {OriginType.SCANNED_IMAGE, OriginType.MIXED}:
@@ -302,14 +340,27 @@ class TriageAgent:
             return StrategyTier.STRATEGY_B
         return StrategyTier.STRATEGY_A
 
-    def _estimate_cost(self, selected_strategy: StrategyTier, pages: int) -> float:
+    def _estimate_cost(self, selected_strategy: StrategyTier, estimated_chars: int, pages: int) -> float:
         strategy_to_key = {
             StrategyTier.STRATEGY_A: "strategy_a",
             StrategyTier.STRATEGY_B: "strategy_b",
             StrategyTier.STRATEGY_C: "strategy_c",
         }
-        base_tier = float(self.cost_tiers[strategy_to_key[selected_strategy]])
-        return round(max(1, int(pages)) * base_tier, 4)
+        tier_value = self.cost_tiers[strategy_to_key[selected_strategy]]
+
+        # Backward compatibility: scalar tier values are treated as cost per million chars.
+        cost_per_million_chars = float(tier_value) if isinstance(tier_value, (int, float)) else 0.0
+        if isinstance(tier_value, dict):
+            if isinstance(tier_value.get("cost_per_million_chars"), (int, float)):
+                cost_per_million_chars = float(tier_value["cost_per_million_chars"])
+            elif isinstance(tier_value.get("cost_per_1k_chars"), (int, float)):
+                cost_per_million_chars = float(tier_value["cost_per_1k_chars"]) * 1000.0
+
+        safe_chars = max(0, int(estimated_chars))
+        if safe_chars == 0:
+            safe_chars = max(1, int(pages)) * int(self.thresholds.get("fallback_chars_per_page", 1200))
+
+        return round((safe_chars / 1_000_000.0) * cost_per_million_chars, 6)
 
     def _calculate_confidence(self, signals: dict[str, Any], origin_type: OriginType) -> float:
         score = float(self.thresholds["confidence_base"])

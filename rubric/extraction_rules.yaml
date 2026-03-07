@@ -65,6 +65,7 @@ extraction_config:
     max_pages_to_process: 3 # Optional cap on pages sent to vision model
   strategy_a:
     min_font_threshold: 1
+    scanned_image_threshold: 0.35 # If image_area/page_area exceeds this, force low confidence for escalation
 
 # Rubric Item: Escalation Guard
 # Controls when the router climbs from FastText -> Layout -> Vision

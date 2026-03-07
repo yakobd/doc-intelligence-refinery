@@ -38,18 +38,73 @@ class ProvenanceChain(BaseModel):
     strategy_used: str
     extraction_timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
+# 4. Chunk Model
+class Chunk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    uid: str
+    content: str
+    content_hash: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    token_count: int = Field(ge=0)
+
+    @field_validator("content")
+    @classmethod
+    def chunk_content_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Chunk content cannot be empty")
+        return v
+
+
+# Cross-references between chunks (e.g., table summary -> source paragraph)
+class ChunkRelationship(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_chunk_uid: str
+    target_chunk_uid: str
+    relationship_type: str = "related"
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
 # 4. Logical Document Units (LDU) (Rubric Item #3 & #4)
 class LDU(BaseModel):
     model_config = ConfigDict(extra="forbid")
     uid: str
-    unit_type: str  # e.g., "table", "paragraph"
     content: str
-    content_hash: str    # Required for Mastery
-    page_refs: List[int] # Required for Mastery
-    bounding_box: BBox   # Required for Mastery
-    parent_section: Optional[str] = None # Recursive relationship
-    child_chunks: List[str] = []         # Chunk relationship
-    
+    chunk_type: str
+    content_hash: str
+    page_refs: List[int]
+    bounding_box: List[float]
+    parent_section: Optional[str] = None
+    token_count: int = Field(default=0, ge=0)
+    child_chunks: List[str] = Field(default_factory=list)
+    chunk_relationships: List[ChunkRelationship] = Field(default_factory=list)
+    chunks: List[Chunk] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+
+        # Backward compatibility: accept `unit_type` and map to `chunk_type`.
+        if "chunk_type" not in normalized and "unit_type" in normalized:
+            normalized["chunk_type"] = normalized.pop("unit_type")
+
+        # Backward compatibility: accept BBox model/dict and convert to list.
+        bbox = normalized.get("bounding_box")
+        if isinstance(bbox, BBox):
+            normalized["bounding_box"] = [bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max]
+        elif isinstance(bbox, dict):
+            if {"x_min", "y_min", "x_max", "y_max"}.issubset(bbox.keys()):
+                normalized["bounding_box"] = [
+                    bbox["x_min"],
+                    bbox["y_min"],
+                    bbox["x_max"],
+                    bbox["y_max"],
+                ]
+
+        return normalized
+
     @field_validator('content')
     @classmethod
     def content_not_empty(cls, v: str) -> str:
@@ -57,13 +112,33 @@ class LDU(BaseModel):
             raise ValueError("LDU content cannot be empty")
         return v
 
+    @field_validator("bounding_box")
+    @classmethod
+    def validate_bounding_box(cls, v: List[float]) -> List[float]:
+        if len(v) != 4:
+            raise ValueError("bounding_box must contain exactly 4 float values")
+        return v
+
+    @model_validator(mode="after")
+    def infer_token_count(self) -> "LDU":
+        # Preserve explicit values; otherwise derive a simple token approximation.
+        if self.token_count == 0 and self.content.strip():
+            self.token_count = len(self.content.split())
+        return self
+
+    @property
+    def unit_type(self) -> str:
+        # Compatibility accessor for existing call sites.
+        return self.chunk_type
+
 # 5. Hierarchical Page/Section Indexing (Rubric Item #4)
 class PageIndexNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str
+    summary: str = ""
     page_start: int
     page_end: int
-    children: List["PageIndexNode"] = [] # Required: Recursive nodes
+    children: List["PageIndexNode"] = Field(default_factory=list) # Required: Recursive nodes
 
     @model_validator(mode='after')
     def validate_range(self) -> 'PageIndexNode':
@@ -83,6 +158,7 @@ class DocumentProfile(BaseModel):
     selected_strategy: StrategyTier
     confidence_score: float = Field(ge=0.0, le=1.0)
     estimated_cost: float
+    estimated_chars: int = 0
     pages: int
     language: str = "en"
     domain_hint: str = "financial"

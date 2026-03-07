@@ -1,5 +1,9 @@
 import json
 import logging
+import os
+import re
+import time
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -7,6 +11,7 @@ from typing import Any
 from src.agents.triage import TriageAgent
 from src.models.document_schema import (
     DocumentProfile,
+    LDU,
     LayoutComplexity,
     NormalizedOutput,
     OriginType,
@@ -21,19 +26,34 @@ from src.utils.config_loader import get_extraction_config, get_router_config, lo
 logger = logging.getLogger(__name__)
 
 
+class ExtractionLedger:
+    """Append-only JSONL ledger for extraction outcomes."""
+
+    def __init__(self, ledger_path: str = "logs/extraction_ledger.jsonl") -> None:
+        self.ledger_path = Path(ledger_path)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log_extraction(self, record: dict[str, Any]) -> None:
+        with self.ledger_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 class ExtractionRouter:
     """Coordinates triage, strategy routing, extraction, escalation, and ledger logging."""
 
     def __init__(self, config: dict[str, Any] | None = None, config_path: str = "rubric/extraction_rules.yaml") -> None:
+        os.makedirs("logs", exist_ok=True)
         self.config = config or load_config(config_path)
         self.triage_agent = TriageAgent(config=self.config, config_path=config_path)
         self.strategy_a = StrategyA(config=self.config)
         self.strategy_b = StrategyB(config=self.config)
         self.strategy_c = StrategyC(config=self.config)
+        self.ledger = ExtractionLedger("logs/extraction_ledger.jsonl")
         self.escalation_thresholds = self._load_escalation_thresholds()
 
     def process_document(self, pdf_path: str) -> NormalizedOutput:
         escalation_history: list[dict[str, Any]] = []
+        total_processing_time = 0.0
 
         try:
             profile = self.triage_agent.profile_document(pdf_path)
@@ -47,6 +67,7 @@ class ExtractionRouter:
                 error_message=f"Triage failed: {triage_error}",
                 escalation_history=escalation_history,
             )
+            extracted.metadata["processing_time"] = 0.0
             self._save_extraction_artifact(extracted)
             self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
             return extracted
@@ -54,11 +75,22 @@ class ExtractionRouter:
         selected_strategy = profile.selected_strategy
 
         # Initial strategy execution based on triage decision
-        extracted = self._run_strategy(selected_strategy, pdf_path, profile, escalation_history)
+        extracted, current_processing_time = self._run_strategy(selected_strategy, pdf_path, profile, escalation_history)
+        total_processing_time += current_processing_time
+        if self._is_budget_exceeded_output(extracted):
+            extracted.profile = extracted.profile.model_copy(update={"selected_strategy": StrategyTier.STRATEGY_C})
+            extracted.metadata["selected_strategy"] = StrategyTier.STRATEGY_C.value
+            extracted.metadata["escalation_history"] = escalation_history
+            extracted.metadata["processing_time"] = round(total_processing_time, 4)
+            extracted = self._ensure_recursive_index(extracted)
+            self._save_extraction_artifact(extracted)
+            self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
+            return extracted
 
         # Multi-level escalation flow (A -> B -> C)
         if selected_strategy == StrategyTier.STRATEGY_A:
             confidence_a = self._average_confidence(extracted)
+            processing_time_a = current_processing_time
             action_a = "kept"
             if confidence_a < float(self.escalation_thresholds["min_confidence_a"]):
                 action_a = "escalated"
@@ -68,12 +100,35 @@ class ExtractionRouter:
                     confidence_a,
                     float(self.escalation_thresholds["min_confidence_a"]),
                 )
-                extracted = self._run_strategy(StrategyTier.STRATEGY_B, pdf_path, profile, escalation_history)
+                extracted, current_processing_time = self._run_strategy(
+                    StrategyTier.STRATEGY_B,
+                    pdf_path,
+                    profile,
+                    escalation_history,
+                )
+                total_processing_time += current_processing_time
+                if self._is_budget_exceeded_output(extracted):
+                    extracted.profile = extracted.profile.model_copy(update={"selected_strategy": StrategyTier.STRATEGY_C})
+                    extracted.metadata["selected_strategy"] = StrategyTier.STRATEGY_C.value
+                    extracted.metadata["escalation_history"] = escalation_history
+                    extracted.metadata["processing_time"] = round(total_processing_time, 4)
+                    extracted = self._ensure_recursive_index(extracted)
+                    self._save_extraction_artifact(extracted)
+                    self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
+                    return extracted
                 selected_strategy = StrategyTier.STRATEGY_B
-            escalation_history.append({"strategy": StrategyTier.STRATEGY_A.value, "confidence": confidence_a, "action": action_a})
+            escalation_history.append(
+                {
+                    "strategy": StrategyTier.STRATEGY_A.value,
+                    "confidence": confidence_a,
+                    "action": action_a,
+                    "processing_time": round(processing_time_a, 4),
+                }
+            )
 
         if selected_strategy == StrategyTier.STRATEGY_B:
             confidence_b = self._average_confidence(extracted)
+            processing_time_b = current_processing_time
             action_b = "kept"
             if confidence_b < float(self.escalation_thresholds["min_confidence_b"]):
                 action_b = "escalated"
@@ -83,15 +138,45 @@ class ExtractionRouter:
                     confidence_b,
                     float(self.escalation_thresholds["min_confidence_b"]),
                 )
-                extracted = self._run_strategy(StrategyTier.STRATEGY_C, pdf_path, profile, escalation_history)
+                extracted, current_processing_time = self._run_strategy(
+                    StrategyTier.STRATEGY_C,
+                    pdf_path,
+                    profile,
+                    escalation_history,
+                )
+                total_processing_time += current_processing_time
+                if self._is_budget_exceeded_output(extracted):
+                    extracted.profile = extracted.profile.model_copy(update={"selected_strategy": StrategyTier.STRATEGY_C})
+                    extracted.metadata["selected_strategy"] = StrategyTier.STRATEGY_C.value
+                    extracted.metadata["escalation_history"] = escalation_history
+                    extracted.metadata["processing_time"] = round(total_processing_time, 4)
+                    extracted = self._ensure_recursive_index(extracted)
+                    self._save_extraction_artifact(extracted)
+                    self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
+                    return extracted
                 selected_strategy = StrategyTier.STRATEGY_C
-            escalation_history.append({"strategy": StrategyTier.STRATEGY_B.value, "confidence": confidence_b, "action": action_b})
+            escalation_history.append(
+                {
+                    "strategy": StrategyTier.STRATEGY_B.value,
+                    "confidence": confidence_b,
+                    "action": action_b,
+                    "processing_time": round(processing_time_b, 4),
+                }
+            )
 
         if selected_strategy == StrategyTier.STRATEGY_C:
             confidence_c = self._average_confidence(extracted)
+            processing_time_c = current_processing_time
             requires_human_review = confidence_c < float(self.escalation_thresholds["min_confidence_final"])
             action_c = "human_review" if requires_human_review else "kept"
-            escalation_history.append({"strategy": StrategyTier.STRATEGY_C.value, "confidence": confidence_c, "action": action_c})
+            escalation_history.append(
+                {
+                    "strategy": StrategyTier.STRATEGY_C.value,
+                    "confidence": confidence_c,
+                    "action": action_c,
+                    "processing_time": round(processing_time_c, 4),
+                }
+            )
             logger.info(
                 "Final Strategy C decision for %s: confidence=%.4f, threshold=%.4f, requires_human_review=%s",
                 profile.filename,
@@ -105,7 +190,9 @@ class ExtractionRouter:
         extracted.profile = extracted.profile.model_copy(update={"selected_strategy": selected_strategy})
         extracted.metadata["selected_strategy"] = selected_strategy.value
         extracted.metadata["escalation_history"] = escalation_history
+        extracted.metadata["processing_time"] = round(total_processing_time, 4)
 
+        extracted = self._refine_ldu_granularity(extracted)
         extracted = self._ensure_recursive_index(extracted)
         self._save_extraction_artifact(extracted)
         self._append_ledger_record(pdf_path=pdf_path, extracted=extracted)
@@ -117,15 +204,47 @@ class ExtractionRouter:
         pdf_path: str,
         profile: DocumentProfile,
         escalation_history: list[dict[str, Any]],
-    ) -> NormalizedOutput:
+    ) -> tuple[NormalizedOutput, float]:
+        start_time = time.perf_counter()
         logger.info("Routing decision: executing %s for %s", strategy.value, profile.filename)
         try:
             if strategy == StrategyTier.STRATEGY_A:
-                return self.strategy_a.extract(pdf_path, profile)
-            if strategy == StrategyTier.STRATEGY_B:
-                return self.strategy_b.extract(pdf_path, profile)
-            return self.strategy_c.extract(pdf_path, profile)
-        except BaseException as strategy_error:
+                extracted = self.strategy_a.extract(pdf_path, profile)
+            elif strategy == StrategyTier.STRATEGY_B:
+                extracted = self.strategy_b.extract(pdf_path, profile)
+            else:
+                extracted = self.strategy_c.extract(pdf_path, profile)
+
+            processing_time = round(time.perf_counter() - start_time, 4)
+            extracted.metadata["processing_time"] = processing_time
+            return extracted, processing_time
+        except ValueError as strategy_error:
+            processing_time = round(time.perf_counter() - start_time, 4)
+            if self._is_budget_error(strategy_error):
+                projected_cost = self._extract_projected_cost(str(strategy_error))
+                warning = (
+                    f"Budget guard blocked Strategy C for {profile.filename}: {strategy_error}. "
+                    "Document skipped due to cost constraints."
+                )
+                logger.warning(warning)
+                escalation_history.append(
+                    {
+                        "strategy": strategy.value,
+                        "confidence": 0.0,
+                        "action": "budget_exceeded",
+                        "error": str(strategy_error),
+                        "processing_time": processing_time,
+                    }
+                )
+                extracted = self._budget_exceeded_output(
+                    profile=profile,
+                    warning_message=warning,
+                    projected_cost=projected_cost,
+                    escalation_history=escalation_history,
+                )
+                extracted.metadata["processing_time"] = processing_time
+                return extracted, processing_time
+
             logger.exception("Strategy %s failed for %s", strategy.value, profile.filename)
             escalation_history.append(
                 {
@@ -133,13 +252,76 @@ class ExtractionRouter:
                     "confidence": 0.0,
                     "action": "failed",
                     "error": str(strategy_error),
+                    "processing_time": processing_time,
                 }
             )
-            return self._partial_output_from_error(
+            extracted = self._partial_output_from_error(
                 profile=profile,
                 error_message=f"Strategy {strategy.value} failed: {strategy_error}",
                 escalation_history=escalation_history,
             )
+            extracted.metadata["processing_time"] = processing_time
+            return extracted, processing_time
+        except BaseException as strategy_error:
+            logger.exception("Strategy %s failed for %s", strategy.value, profile.filename)
+            processing_time = round(time.perf_counter() - start_time, 4)
+            escalation_history.append(
+                {
+                    "strategy": strategy.value,
+                    "confidence": 0.0,
+                    "action": "failed",
+                    "error": str(strategy_error),
+                    "processing_time": processing_time,
+                }
+            )
+            extracted = self._partial_output_from_error(
+                profile=profile,
+                error_message=f"Strategy {strategy.value} failed: {strategy_error}",
+                escalation_history=escalation_history,
+            )
+            extracted.metadata["processing_time"] = processing_time
+            return extracted, processing_time
+
+    def _is_budget_error(self, error: ValueError) -> bool:
+        message = str(error).lower()
+        return "budget exceeded" in message
+
+    def _extract_projected_cost(self, error_message: str) -> float:
+        match = re.search(r"projected\s*\$\s*([0-9]+(?:\.[0-9]+)?)", error_message, flags=re.IGNORECASE)
+        if not match:
+            return 0.0
+        try:
+            return round(float(match.group(1)), 6)
+        except ValueError:
+            return 0.0
+
+    def _is_budget_exceeded_output(self, extracted: NormalizedOutput) -> bool:
+        return extracted.metadata.get("status") == "BUDGET_EXCEEDED"
+
+    def _budget_exceeded_output(
+        self,
+        profile: DocumentProfile,
+        warning_message: str,
+        projected_cost: float,
+        escalation_history: list[dict[str, Any]],
+    ) -> NormalizedOutput:
+        return NormalizedOutput(
+            filename=profile.filename,
+            doc_id=Path(profile.filename).stem,
+            profile=profile,
+            ldus=[],
+            index=[PageIndexNode(title="Page 1", page_start=1, page_end=1, children=[])],
+            metadata={
+                "status": "BUDGET_EXCEEDED",
+                "selected_strategy": StrategyTier.STRATEGY_C.value,
+                "avg_confidence": 0.0,
+                "projected_cost": projected_cost,
+                "provenance_chain": [],
+                "warning": warning_message,
+                "requires_human_review": True,
+                "escalation_history": escalation_history,
+            },
+        )
 
     def _load_escalation_thresholds(self) -> dict[str, float]:
         default_thresholds = {
@@ -212,21 +394,29 @@ class ExtractionRouter:
             file.write(profile.model_dump_json(indent=2))
 
     def _append_ledger_record(self, pdf_path: str, extracted: NormalizedOutput) -> None:
-        ledger_dir = Path(".refinery")
-        ledger_dir.mkdir(parents=True, exist_ok=True)
-        ledger_path = ledger_dir / "extraction_ledger.jsonl"
-
         selected_strategy = extracted.metadata.get("selected_strategy", extracted.profile.selected_strategy.value)
+        final_cost = self._estimated_cost(extracted)
+        status = str(extracted.metadata.get("status", "SUCCESS"))
+        if status == "BUDGET_EXCEEDED":
+            cost_status = "BUDGET_EXCEEDED"
+        elif status == "SUCCESS":
+            cost_status = "WITHIN_BUDGET"
+        else:
+            cost_status = "FAILED"
+
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "filename": Path(pdf_path).name,
             "strategy_used": selected_strategy,
-            "avg_confidence": self._average_confidence(extracted),
-            "estimated_cost": self._estimated_cost(extracted),
+            "confidence_score": self._average_confidence(extracted),
+            "final_cost": final_cost,
+            "cost_estimate": final_cost,
+            "cost_status": cost_status,
+            "processing_time": round(float(extracted.metadata.get("processing_time", 0.0)), 4),
+            "status": status,
+            "warning": extracted.metadata.get("warning", ""),
         }
-
-        with ledger_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.ledger.log_extraction(record)
 
     def _save_extraction_artifact(self, extracted: NormalizedOutput) -> None:
         extraction_dir = Path(".refinery/extractions")
@@ -254,12 +444,95 @@ class ExtractionRouter:
         return round(fallback_confidence, 4)
 
     def _estimated_cost(self, extracted: NormalizedOutput) -> float:
+        metadata_projected_cost = extracted.metadata.get("projected_cost")
+        if isinstance(metadata_projected_cost, (int, float)):
+            return round(float(metadata_projected_cost), 6)
+
         selected_strategy = extracted.metadata.get("selected_strategy", extracted.profile.selected_strategy.value)
         if selected_strategy == StrategyTier.STRATEGY_C.value:
-            unique_pages = {page for ldu in extracted.ldus for page in ldu.page_refs}
-            pages_count = len(unique_pages) if unique_pages else max(1, extracted.profile.pages)
-            return round(pages_count * float(self.strategy_c.cost_per_page), 4)
+            return 0.0
         return 0.0
+
+    def _refine_ldu_granularity(self, extracted: NormalizedOutput) -> NormalizedOutput:
+        refined_ldus: list[LDU] = []
+
+        for ldu in extracted.ldus:
+            # Keep table-like structures intact to avoid breaking row semantics.
+            if (ldu.unit_type or "").lower() == "table":
+                refined_ldus.append(ldu)
+                continue
+
+            raw_lines = (ldu.content or "").split("\n")
+            if not raw_lines:
+                continue
+
+            segments: list[tuple[str, str]] = []
+            current_body_lines: list[str] = []
+
+            for raw_line in raw_lines:
+                line = raw_line.strip()
+
+                if not line:
+                    if current_body_lines:
+                        segments.append(("paragraph", " ".join(current_body_lines).strip()))
+                        current_body_lines = []
+                    continue
+
+                if self._is_header_line(line):
+                    if current_body_lines:
+                        segments.append(("paragraph", " ".join(current_body_lines).strip()))
+                        current_body_lines = []
+                    segments.append(("header", line))
+                    continue
+
+                current_body_lines.append(line)
+
+            if current_body_lines:
+                segments.append(("paragraph", " ".join(current_body_lines).strip()))
+
+            segment_counter = 0
+            for segment_unit_type, segment_text in segments:
+                segment = (segment_text or "").strip()
+                if not segment:
+                    continue
+
+                segment_counter += 1
+                segment_hash = hashlib.md5(segment.encode("utf-8")).hexdigest()
+                refined_ldus.append(
+                    LDU(
+                        uid=f"{ldu.uid}-seg{segment_counter:02d}",
+                        unit_type=segment_unit_type,
+                        content=segment,
+                        content_hash=segment_hash,
+                        page_refs=list(ldu.page_refs),
+                        bounding_box=ldu.bounding_box,
+                        parent_section=ldu.parent_section,
+                        child_chunks=[segment],
+                        chunks=list(ldu.chunks),
+                    )
+                )
+
+        extracted.ldus = refined_ldus
+        return extracted
+
+    def _is_header_line(self, line: str) -> bool:
+        candidate = (line or "").strip()
+        if not candidate:
+            return False
+
+        if len(candidate) >= 80 or candidate.endswith("."):
+            return False
+
+        if re.match(r"^\d", candidate):
+            return True
+
+        if candidate.isupper():
+            return True
+
+        if candidate.istitle():
+            return True
+
+        return False
 
     def _ensure_recursive_index(self, extracted: NormalizedOutput) -> NormalizedOutput:
         if extracted.index:
@@ -280,9 +553,22 @@ class ExtractionRouter:
             extracted.index = [PageIndexNode(title="Page 1", page_start=1, page_end=1, children=[])]
             return extracted
 
+        page_titles: dict[int, str] = {}
+        for ldu in extracted.ldus:
+            if (ldu.unit_type or "").lower() != "header":
+                continue
+
+            header_text = (ldu.content or "").strip().splitlines()[0] if ldu.content else ""
+            if not header_text:
+                continue
+
+            for page in ldu.page_refs:
+                if page not in page_titles:
+                    page_titles[page] = header_text
+
         extracted.index = [
             PageIndexNode(
-                title=f"Page {page_number}",
+                title=page_titles.get(page_number, f"Page {page_number}"),
                 page_start=page_number,
                 page_end=page_number,
                 children=[],
