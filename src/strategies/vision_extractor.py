@@ -30,7 +30,7 @@ class StrategyC(BaseStrategy):
     """Vision-assisted extraction strategy for scanned or difficult PDFs."""
 
     DEFAULT_COST_PER_1K_TOKENS = 0.000125
-    DEFAULT_MODEL = "google/gemini-flash-1.5"
+    DEFAULT_MODEL = "anthropic/claude-3.5-sonnet"
     OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -239,7 +239,10 @@ class StrategyC(BaseStrategy):
         if not api_key:
             return {"pages": []}
 
-        model_name = os.getenv("OPENROUTER_MODEL", self.default_model)
+        # FORCE the correct model (ignores any wrong env var)
+        model_name = "anthropic/claude-3.5-sonnet"
+        print(f"DEBUG: Using model -> {model_name}")   # <-- added for confirmation
+
         instruction = (
             "You are a multimodal document analyst. Analyze each page's text and optional image. "
             "Identify section titles/headers versus normal paragraphs to support hierarchical indexing. "
@@ -302,7 +305,6 @@ class StrategyC(BaseStrategy):
             httpx_module=httpx_module,
         )
         return self._coerce_json_payload(repaired_content)
-
     def _extract_message_content(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices", [])
         if not choices:

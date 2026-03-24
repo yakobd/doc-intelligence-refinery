@@ -17,6 +17,7 @@ from src.models.document_schema import (
 )
 from src.strategies.base_strategy import BaseStrategy
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,10 +27,10 @@ class StrategyB(BaseStrategy):
         super().__init__(config=config)
 
     def extract(self, pdf_path: str, profile: DocumentProfile) -> NormalizedOutput:
-        if os.getenv("ENABLE_DOCLING_ADAPTER", "0") != "1":
-            fallback = self._fallback_extract_with_pdfplumber(pdf_path=pdf_path, profile=profile)
-            fallback.metadata["warning"] = "Docling adapter disabled; pdfplumber fallback used"
-            return fallback
+        # FORCE stable pdfplumber fallback (memory-safe for Week 3 submission)
+        fallback = self._fallback_extract_with_pdfplumber(pdf_path=pdf_path, profile=profile)
+        fallback.metadata["warning"] = "Docling disabled for stability; pdfplumber fallback used"
+        return fallback
 
         converter_cls = self._load_docling_converter()
         if converter_cls is not None:
@@ -54,7 +55,19 @@ class StrategyB(BaseStrategy):
         warnings: list[str] = []
 
         converter = converter_cls()
+
+        # MEMORY FIX - reduce batch size to prevent bad_alloc on Windows laptops
+        try:
+            if hasattr(converter, "pipeline_options"):
+                converter.pipeline_options.page_batch_size = 4
+            if hasattr(converter, "ocr_options"):
+                converter.ocr_options.batch_size = 4
+        except:
+            pass  # safe fallback
+
         result = converter.convert(pdf_path)
+
+
         document = result.document
 
         ordered_elements = self._collect_and_sort_docling_elements(document=document)
